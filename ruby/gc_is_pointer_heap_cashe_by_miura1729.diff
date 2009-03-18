@@ -1,0 +1,45 @@
+Index: gc.c
+===================================================================
+--- gc.c	(リビジョン 18122)
++++ gc.c	(作業コピー)
+@@ -157,6 +157,7 @@
+     struct {
+ 	size_t increment;
+ 	struct heaps_slot *ptr;
++	RVALUE *last_look;
+ 	size_t length;
+ 	size_t used;
+ 	RVALUE *freelist;
+@@ -193,6 +194,7 @@
+ #define malloc_increase 	objspace->malloc_params.increase
+ #define heap_slots		objspace->heap.slots
+ #define heaps			objspace->heap.ptr
++#define last_look_slot		objspace->heap.last_look
+ #define heaps_length		objspace->heap.length
+ #define heaps_used		objspace->heap.used
+ #define freelist		objspace->heap.freelist
+@@ -892,6 +894,12 @@
+     if (p < lomem || p > himem) return Qfalse;
+     if ((VALUE)p % sizeof(RVALUE) != 0) return Qfalse;
+ 
++    if (last_look_slot) {
++	if (last_look_slot <= p && p < (RVALUE *)((size_t)last_look_slot + HEAP_SIZE)) {
++	    return Qtrue;
++	}
++    }
++
+     /* check if p looks like a pointer using bsearch*/
+     lo = 0;
+     hi = heaps_used;
+@@ -899,8 +907,10 @@
+ 	mid = (lo + hi) / 2;
+ 	heap = &heaps[mid];
+ 	if (heap->slot <= p) {
+-	    if (p < heap->slot + heap->limit)
++	    if (p < heap->slot + heap->limit) {
++		last_look_slot = heap->slot;
+ 		return Qtrue;
++	    }
+ 	    lo = mid + 1;
+ 	}
+ 	else {

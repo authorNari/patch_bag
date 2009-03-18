@@ -1,0 +1,54 @@
+Index: gc.c
+===================================================================
+--- gc.c	(revision 19761)
++++ gc.c	(working copy)
+@@ -1109,6 +1109,8 @@
+     }
+ }
+ 
++struct heaps_slot *cached_pointer_to_latest_heap = 0;
++
+ static inline int
+ is_pointer_to_heap(rb_objspace_t *objspace, void *ptr)
+ {
+@@ -1118,7 +1120,10 @@
+ 
+     if (p < lomem || p > himem) return Qfalse;
+     if ((VALUE)p % sizeof(RVALUE) != 0) return Qfalse;
+-
++    if( cached_pointer_to_latest_heap && (p >= cached_pointer_to_latest_heap->slot) && (p < cached_pointer_to_latest_heap->slot + cached_pointer_to_latest_heap->limit) )
++    {
++	return Qtrue;
++    }
+     /* check if p looks like a pointer using bsearch*/
+     lo = 0;
+     hi = heaps_used;
+@@ -1127,7 +1132,10 @@
+ 	heap = &heaps[mid];
+ 	if (heap->slot <= p) {
+ 	    if (p < heap->slot + heap->limit)
+-		return Qtrue;
++		{
++			cached_pointer_to_latest_heap = heap;
++			return Qtrue;
++		}
+ 	    lo = mid + 1;
+ 	}
+ 	else {
+@@ -1589,7 +1597,6 @@
+ {
+     size_t i, j;
+     RVALUE *last = 0;
+-
+     for (i = j = 1; j < heaps_used; i++) {
+ 	if (heaps[i].limit == 0) {
+ 	    if (!last) {
+@@ -1926,7 +1933,7 @@
+     }
+     during_gc++;
+     objspace->count++;
+-
++    cached_pointer_to_latest_heap = 0;
+     GC_PROF_TIMER_START;
+     GC_PROF_MARK_TIMER_START;
+     SET_STACK_END;

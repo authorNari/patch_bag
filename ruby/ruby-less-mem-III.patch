@@ -1,0 +1,1004 @@
+diff -x .svn -urN ruby-1.8.6.pristine/common.mk ruby-1.8.6/common.mk
+--- ruby-1.8.6.pristine/common.mk	2007-02-28 06:23:42.000000000 -0700
++++ ruby-1.8.6/common.mk	2007-11-03 00:16:32.000000000 -0600
+@@ -52,6 +52,7 @@
+ 		util.$(OBJEXT) \
+ 		variable.$(OBJEXT) \
+ 		version.$(OBJEXT) \
++		gc_heap.$(OBJEXT) \
+ 		$(MISSING)
+ 
+ SCRIPT_ARGS   =	--dest-dir="$(DESTDIR)" \
+@@ -371,13 +372,16 @@
+   {$(VPATH)}defines.h {$(VPATH)}intern.h {$(VPATH)}missing.h \
+   {$(VPATH)}rubyio.h {$(VPATH)}rubysig.h {$(VPATH)}util.h \
+   {$(VPATH)}dln.h
+-gc.$(OBJEXT): {$(VPATH)}gc.c {$(VPATH)}ruby.h config.h \
++gc.$(OBJEXT): {$(VPATH)}gc.c {$(VPATH)}gc_heap.h {$(VPATH)}ruby.h config.h \
+   {$(VPATH)}defines.h {$(VPATH)}intern.h {$(VPATH)}missing.h \
+   {$(VPATH)}rubysig.h {$(VPATH)}st.h {$(VPATH)}node.h \
+   {$(VPATH)}env.h {$(VPATH)}re.h {$(VPATH)}regex.h
+ hash.$(OBJEXT): {$(VPATH)}hash.c {$(VPATH)}ruby.h config.h \
+   {$(VPATH)}defines.h {$(VPATH)}intern.h {$(VPATH)}missing.h \
+   {$(VPATH)}st.h {$(VPATH)}util.h {$(VPATH)}rubysig.h
++heap.$(OBJEXT): {$(VPATH)}heap.c {$(VPATH)}gc_heap.h {$(VPATH)}ruby.h config.h \
++  {$(VPATH)}defines.h {$(VPATH)}intern.h {$(VPATH)}missing.h \
++  {$(VPATH)}st.h {$(VPATH)}util.h {$(VPATH)}rubysig.h
+ inits.$(OBJEXT): {$(VPATH)}inits.c {$(VPATH)}ruby.h config.h \
+   {$(VPATH)}defines.h {$(VPATH)}intern.h {$(VPATH)}missing.h
+ io.$(OBJEXT): {$(VPATH)}io.c {$(VPATH)}ruby.h config.h \
+diff -x .svn -urN ruby-1.8.6.pristine/gc.c ruby-1.8.6/gc.c
+--- ruby-1.8.6.pristine/gc.c	2007-03-03 00:30:46.000000000 -0700
++++ ruby-1.8.6/gc.c	2007-11-03 00:26:08.000000000 -0600
+@@ -12,6 +12,7 @@
+ 
+ **********************************************************************/
+ 
++#include "gc_heap.h"
+ #include "ruby.h"
+ #include "rubysig.h"
+ #include "st.h"
+@@ -21,6 +22,7 @@
+ #include <stdio.h>
+ #include <setjmp.h>
+ #include <sys/types.h>
++#include <assert.h>
+ 
+ #ifdef HAVE_SYS_TIME_H
+ #include <sys/time.h>
+@@ -68,6 +70,7 @@
+ #endif
+ #endif
+ 
++static unsigned long gc_num_passes = 0;
+ static unsigned long malloc_increase = 0;
+ static unsigned long malloc_limit = GC_MALLOC_LIMIT;
+ static void run_final();
+@@ -165,7 +168,6 @@
+ static int need_call_final = 0;
+ static st_table *finalizer_table = 0;
+ 
+-
+ /*
+  *  call-seq:
+  *     GC.enable    => true or false
+@@ -297,91 +299,65 @@
+ #pragma pack(pop)
+ #endif
+ 
+-static RVALUE *freelist = 0;
+ static RVALUE *deferred_final_list = 0;
+ 
+-#define HEAPS_INCREMENT 10
+-static struct heaps_slot {
+-    void *membase;
+-    RVALUE *slot;
+-    int limit;
+-} *heaps;
+-static int heaps_length = 0;
+-static int heaps_used   = 0;
+-
+-#define HEAP_MIN_SLOTS 10000
+-static int heap_slots = HEAP_MIN_SLOTS;
++#define RANY(o) ((RVALUE*)(o))
+ 
+-#define FREE_MIN  4096
++VALUE
++rb_gc_heap_info()
++{
++    /* allocate new hash */ 
++    VALUE h = rb_hash_new();
+ 
+-static RVALUE *himem, *lomem;
++    /* set the number of heaps in use */ 
+ 
+-static void
+-add_heap()
+-{
+-    RVALUE *p, *pend;
++    /* determine the total allocated heap memory and slots */
++    {
++        rb_heap_stats s;
++        rb_heap_get_stats(&s);
+ 
+-    if (heaps_used == heaps_length) {
+-	/* Realloc heaps */
+-	struct heaps_slot *p;
+-	int length;
+-
+-	heaps_length += HEAPS_INCREMENT;
+-	length = heaps_length*sizeof(struct heaps_slot);
+-	RUBY_CRITICAL(
+-	    if (heaps_used > 0) {
+-		p = (struct heaps_slot *)realloc(heaps, length);
+-		if (p) heaps = p;
+-	    }
+-	    else {
+-		p = heaps = (struct heaps_slot *)malloc(length);
+-	    });
+-	if (p == 0) rb_memerror();
+-    }
+-
+-    for (;;) {
+-	RUBY_CRITICAL(p = (RVALUE*)malloc(sizeof(RVALUE)*(heap_slots+1)));
+-	if (p == 0) {
+-	    if (heap_slots == HEAP_MIN_SLOTS) {
+-		rb_memerror();
+-	    }
+-	    heap_slots = HEAP_MIN_SLOTS;
+-	    continue;
+-	}
+-        heaps[heaps_used].membase = p;
+-        if ((VALUE)p % sizeof(RVALUE) == 0)
+-            heap_slots += 1;
+-        else
+-            p = (RVALUE*)((VALUE)p + sizeof(RVALUE) - ((VALUE)p % sizeof(RVALUE)));
+-        heaps[heaps_used].slot = p;
+-        heaps[heaps_used].limit = heap_slots;
+-	break;
+-    }
+-    pend = p + heap_slots;
+-    if (lomem == 0 || lomem > p) lomem = p;
+-    if (himem < pend) himem = pend;
+-    heaps_used++;
+-    heap_slots *= 1.8;
+-    if (heap_slots <= 0) heap_slots = HEAP_MIN_SLOTS;
+-
+-    while (p < pend) {
+-	p->as.free.flags = 0;
+-	p->as.free.next = freelist;
+-	freelist = p;
+-	p++;
+-    }
++        rb_hash_aset(h, rb_str_new2("heap_max_memory"),
++                     rb_uint2inum(s.maxMem));
++        rb_hash_aset(h, rb_str_new2("heap_current_memory"),
++                     rb_uint2inum(s.currentMem));
++        rb_hash_aset(h, rb_str_new2("heap_slots_allocated"),
++                     rb_uint2inum(s.totalSlots));
++        rb_hash_aset(h, rb_str_new2("heap_slots_used"),
++                     rb_uint2inum(s.usedSlots));
++        rb_hash_aset(h, rb_str_new2("num_heaps"),
++                     rb_uint2inum(s.heapsUsed));
++    }
++
++    /* and how many times have we gc'd */
++    rb_hash_aset(h, rb_str_new2("num_gc_passes"), rb_uint2inum(gc_num_passes));
++    
++    return h;
+ }
+-#define RANY(o) ((RVALUE*)(o))
+ 
+ VALUE
+ rb_newobj()
+ {
+     VALUE obj;
++    // when should we do the next GC 
++    static unsigned long doGCAt = 0;
+ 
+-    if (!freelist) garbage_collect();
+-
+-    obj = (VALUE)freelist;
+-    freelist = freelist->as.free.next;
++    {
++        if (!doGCAt) {
++            rb_heap_stats hs_before;
++            rb_heap_get_stats(&hs_before);
++            doGCAt = .75 * hs_before.totalSlots;
++            if (doGCAt < 5000) doGCAt = 5000;
++        } else if (doGCAt <= rb_heap_used_slots()) {
++            garbage_collect();
++
++            /* when heap fragmentation is high, run gc more frequently
++             * to compact heap */ 
++            doGCAt = (rb_heap_used_slots() *
++                      (1.3 + rb_heap_get_used_percentage()));
++        }
++    }
++    
++    obj = (VALUE)rb_heap_get_slot();
+     MEMZERO((void*)obj, RVALUE, 1);
+ #ifdef GC_DEBUG
+     RANY(obj)->file = ruby_sourcefile;
+@@ -565,13 +541,14 @@
+ static void
+ gc_mark_all()
+ {
++    void * ctx = NULL;
+     RVALUE *p, *pend;
+     int i;
+ 
+     init_mark_stack();
+-    for (i = 0; i < heaps_used; i++) {
+-	p = heaps[i].slot; pend = p + heaps[i].limit;
+-	while (p < pend) {
++    
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
++        while (p < pend) {
+ 	    if ((p->as.basic.flags & FL_MARK) &&
+ 		(p->as.basic.flags != FL_MARK)) {
+ 		gc_mark_children((VALUE)p, 0);
+@@ -601,20 +578,7 @@
+ is_pointer_to_heap(ptr)
+     void *ptr;
+ {
+-    register RVALUE *p = RANY(ptr);
+-    register RVALUE *heap_org;
+-    register long i;
+-
+-    if (p < lomem || p > himem) return Qfalse;
+-    if ((VALUE)p % sizeof(RVALUE) != 0) return Qfalse;
+-
+-    /* check if p looks like a pointer */
+-    for (i=0; i < heaps_used; i++) {
+-	heap_org = heaps[i].slot;
+-	if (heap_org <= p && p < heap_org + heaps[i].limit)
+-	    return Qtrue;
+-    }
+-    return Qfalse;
++    return (rb_heap_on_heap_p(ptr) ? Qtrue : Qfalse);
+ }
+ 
+ static void
+@@ -1006,31 +970,11 @@
+     while (p) {
+ 	RVALUE *tmp = p->as.free.next;
+ 	run_final((VALUE)p);
+-	if (!FL_TEST(p, FL_SINGLETON)) { /* not freeing page */
+-	    p->as.free.flags = 0;
+-	    p->as.free.next = freelist;
+-	    freelist = p;
+-	}
+-	p = tmp;
+-    }
+-}
+ 
+-static void
+-free_unused_heaps()
+-{
+-    int i, j;
++        p->as.free.flags = 0;
++        rb_heap_release_slot(p);
+ 
+-    for (i = j = 1; j < heaps_used; i++) {
+-	if (heaps[i].limit == 0) {
+-	    free(heaps[i].membase);
+-	    heaps_used--;
+-	}
+-	else {
+-	    if (i != j) {
+-		heaps[j] = heaps[i];
+-	    }
+-	    j++;
+-	}
++	p = tmp;
+     }
+ }
+ 
+@@ -1039,24 +983,17 @@
+ static void
+ gc_sweep()
+ {
++    void * ctx = NULL;
+     RVALUE *p, *pend, *final_list;
+     int freed = 0;
+     int i;
+     unsigned long live = 0;
+-    unsigned long free_min = 0;
+-
+-    for (i = 0; i < heaps_used; i++) {
+-        free_min += heaps[i].limit;
+-    }
+-    free_min = free_min * 0.2;
+-    if (free_min < FREE_MIN)
+-        free_min = FREE_MIN;
+ 
+     if (ruby_in_compile && ruby_parser_stack_on_heap()) {
+ 	/* should not reclaim nodes during compilation
+            if yacc's semantic stack is not allocated on machine stack */
+-	for (i = 0; i < heaps_used; i++) {
+-	    p = heaps[i].slot; pend = p + heaps[i].limit;
++        void * ctx = NULL;
++	while (rb_heap_iterator_next(&ctx, &p, &pend)) {
+ 	    while (p < pend) {
+ 		if (!(p->as.basic.flags&FL_MARK) && BUILTIN_TYPE(p) == T_NODE)
+ 		    gc_mark((VALUE)p, 0);
+@@ -1070,71 +1007,58 @@
+         st_foreach(source_filenames, sweep_source_filename, 0);
+     }
+ 
+-    freelist = 0;
+     final_list = deferred_final_list;
+     deferred_final_list = 0;
+-    for (i = 0; i < heaps_used; i++) {
+-	int n = 0;
+-	RVALUE *free = freelist;
++    
++    ctx = NULL;
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
+ 	RVALUE *final = final_list;
+ 
+-	p = heaps[i].slot; pend = p + heaps[i].limit;
+ 	while (p < pend) {
+-	    if (!(p->as.basic.flags & FL_MARK)) {
+-		if (p->as.basic.flags) {
+-		    obj_free((VALUE)p);
+-		}
+-		if (need_call_final && FL_TEST(p, FL_FINALIZE)) {
+-		    p->as.free.flags = FL_MARK; /* remain marked */
+-		    p->as.free.next = final_list;
+-		    final_list = p;
+-		}
+-		else {
+-		    p->as.free.flags = 0;
+-		    p->as.free.next = freelist;
+-		    freelist = p;
+-		}
+-		n++;
+-	    }
+-	    else if (RBASIC(p)->flags == FL_MARK) {
+-		/* objects to be finalized */
+-		/* do nothing remain marked */
+-	    }
+-	    else {
+-		RBASIC(p)->flags &= ~FL_MARK;
+-		live++;
+-	    }
+-	    p++;
+-	}
+-	if (n == heaps[i].limit && freed > free_min) {
+-	    RVALUE *pp;
+-
+-	    heaps[i].limit = 0;
+-	    for (pp = final_list; pp != final; pp = pp->as.free.next) {
+-		pp->as.free.flags |= FL_SINGLETON; /* freeing page mark */
+-	    }
+-	    freelist = free;	/* cancel this page from freelist */
+-	}
+-	else {
+-	    freed += n;
+-	}
++            if (p->as.basic.flags) {
++                if (!(p->as.basic.flags & FL_MARK)) {
++                    obj_free((VALUE)p);
++
++                    if (need_call_final && FL_TEST(p, FL_FINALIZE)) {
++                        p->as.free.flags = FL_MARK; /* remain marked */
++                        p->as.free.next = final_list;
++                        final_list = p;
++                    }
++                    else
++                    {
++                        p->as.free.flags = 0;
++                        rb_heap_release_slot(p);
++                    }
++                }
++                else if (RBASIC(p)->flags == FL_MARK) {
++                    /* objects to be finalized */
++                    /* do nothing remain marked */
++                }
++                else {
++                    RBASIC(p)->flags &= ~FL_MARK;
++                    live++;
++                }
++            }
++            p++;
++        }
+     }
+     if (malloc_increase > malloc_limit) {
+ 	malloc_limit += (malloc_increase - malloc_limit) * (double)live / (live + freed);
+ 	if (malloc_limit < GC_MALLOC_LIMIT) malloc_limit = GC_MALLOC_LIMIT;
+     }
+     malloc_increase = 0;
+-    if (freed < free_min) {
+-	add_heap();
+-    }
++
+     during_gc = 0;
+ 
+     /* clear finalization list */
+     if (final_list) {
+-	deferred_final_list = final_list;
+-	return;
++        deferred_final_list = final_list;
++        return;
++    } else {
++        rb_heap_compact();
++/*         printf("AFTER:\n"); */
++/*         dump_heap_info(); */
+     }
+-    free_unused_heaps();
+ }
+ 
+ void
+@@ -1142,8 +1066,7 @@
+     VALUE p;
+ {
+     RANY(p)->as.free.flags = 0;
+-    RANY(p)->as.free.next = freelist;
+-    freelist = RANY(p);
++    rb_heap_release_slot((void *) p);
+ }
+ 
+ static void
+@@ -1325,20 +1248,26 @@
+     jmp_buf save_regs_gc_mark;
+     SET_STACK_END;
+ 
++    {
++/*         printf("pre GC:  (%lu bytes) heap use: %g%%\n", */
++/*                rb_heap_total_mem(), */
++/*                rb_heap_get_used_percentage()); */
++    }
++
++
+ #ifdef HAVE_NATIVETHREAD
+     if (!is_ruby_native_thread()) {
+ 	rb_bug("cross-thread violation on rb_gc()");
+     }
+ #endif
+     if (dont_gc || during_gc) {
+-	if (!freelist) {
+-	    add_heap();
+-	}
+ 	return;
+     }
+     if (during_gc) return;
+     during_gc++;
+ 
++    gc_num_passes++;
++    
+     init_mark_stack();
+ 
+     gc_mark((VALUE)ruby_current_node, 0);
+@@ -1414,6 +1343,13 @@
+     } while (!MARK_STACK_EMPTY);
+ 
+     gc_sweep();
++
++    {
++/*         printf("post GC: (%lu bytes) heap use: %g%% -- next gc factor: %g\n", */
++/*                rb_heap_total_mem(), */
++/*                rb_heap_get_used_percentage(), */
++/*                (1.3 + rb_heap_get_used_percentage())); */
++    }
+ }
+ 
+ void
+@@ -1595,19 +1531,60 @@
+     if (!rb_gc_stack_start) {
+ 	Init_stack(0);
+     }
+-    add_heap();
++    rb_heap_init(sizeof(RVALUE));
+ }
+ 
+ static VALUE
+-os_live_obj()
++os_live_special()
+ {
+     int i;
+     int n = 0;
++    int class = 0, varmap = 0, scope = 0, node = 0,
++        singleton = 0, immediate = 0;
++    RVALUE *p, *pend;
++    void * ctx = NULL;
++
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
++	for (;p < pend; p++) {
++	    if (p->as.basic.flags) {
++		switch (TYPE(p)) {
++                    case T_ICLASS: class++; continue;
++                    case T_VARMAP: varmap++; continue;
++                    case T_SCOPE: scope++; continue;
++                    case T_NODE: node++; continue;
++                    case T_CLASS:
++                        if (FL_TEST(p, FL_SINGLETON)) singleton++;
++                        continue;
++                    default:
++                        if (p->as.basic.klass) continue;
++                        immediate++;
++		}
++	    }
++	}
++    }
++
++    /* allocate new hash */ 
++    VALUE h = rb_hash_new();
+ 
+-    for (i = 0; i < heaps_used; i++) {
+-	RVALUE *p, *pend;
++    rb_hash_aset(h, ID2SYM(rb_intern("class")), rb_uint2inum(class));
++    rb_hash_aset(h, ID2SYM(rb_intern("varmap")), rb_uint2inum(varmap));
++    rb_hash_aset(h, ID2SYM(rb_intern("scope")), rb_uint2inum(scope));
++    rb_hash_aset(h, ID2SYM(rb_intern("node")), rb_uint2inum(node));
++    rb_hash_aset(h, ID2SYM(rb_intern("singleton")), rb_uint2inum(singleton));
++    rb_hash_aset(h, ID2SYM(rb_intern("immediate")), rb_uint2inum(immediate));
+ 
+-	p = heaps[i].slot; pend = p + heaps[i].limit;
++    return h;
++}
++
++static VALUE
++os_live_obj()
++{
++    int i;
++    int n = 0;
++    RVALUE *p, *pend;
++    void * ctx = NULL;
++
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
+ 	for (;p < pend; p++) {
+ 	    if (p->as.basic.flags) {
+ 		switch (TYPE(p)) {
+@@ -1636,11 +1613,10 @@
+ {
+     int i;
+     int n = 0;
+-
+-    for (i = 0; i < heaps_used; i++) {
+-	RVALUE *p, *pend;
+-
+-	p = heaps[i].slot; pend = p + heaps[i].limit;
++    RVALUE *p, *pend;
++    void * ctx = NULL;
++    
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
+ 	for (;p < pend; p++) {
+ 	    if (p->as.basic.flags) {
+ 		switch (TYPE(p)) {
+@@ -1886,14 +1862,15 @@
+ 
+     deferred_final_list = 0;
+     if (p) {
+-	finalize_list(p);
+-	free_unused_heaps();
++        finalize_list(p);
++        rb_heap_compact();
+     }
+ }
+ 
+ void
+ rb_gc_call_finalizer_at_exit()
+ {
++    void * ctx;
+     RVALUE *p, *pend;
+     int i;
+ 
+@@ -1902,8 +1879,9 @@
+ 	p = deferred_final_list;
+ 	deferred_final_list = 0;
+ 	finalize_list(p);
+-	for (i = 0; i < heaps_used; i++) {
+-	    p = heaps[i].slot; pend = p + heaps[i].limit;
++
++        ctx = NULL;
++        while (rb_heap_iterator_next(&ctx, &p, &pend)) {
+ 	    while (p < pend) {
+ 		if (FL_TEST(p, FL_FINALIZE)) {
+ 		    FL_UNSET(p, FL_FINALIZE);
+@@ -1915,8 +1893,8 @@
+ 	}
+     }
+     /* run data object's finalizers */
+-    for (i = 0; i < heaps_used; i++) {
+-	p = heaps[i].slot; pend = p + heaps[i].limit;
++    ctx = NULL;
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
+ 	while (p < pend) {
+ 	    if (BUILTIN_TYPE(p) == T_DATA &&
+ 		DATA_PTR(p) && RANY(p)->as.data.dfree) {
+@@ -2062,9 +2040,13 @@
+     rb_define_singleton_method(rb_mGC, "start", rb_gc_start, 0);
+     rb_define_singleton_method(rb_mGC, "enable", rb_gc_enable, 0);
+     rb_define_singleton_method(rb_mGC, "disable", rb_gc_disable, 0);
++    rb_define_singleton_method(rb_mGC, "heap_info", rb_gc_heap_info, 0);
++
+     rb_define_method(rb_mGC, "garbage_collect", rb_gc_start, 0);
+ 
+     rb_mObSpace = rb_define_module("ObjectSpace");
++    rb_define_module_function(rb_mObSpace, "each_special_object",
++                              os_live_special, 0);
+     rb_define_module_function(rb_mObSpace, "each_object", os_each_obj, -1);
+     rb_define_module_function(rb_mObSpace, "garbage_collect", rb_gc_start, 0);
+     rb_define_module_function(rb_mObSpace, "add_finalizer", add_final, 1);
+diff -x .svn -urN ruby-1.8.6.pristine/gc_heap.c ruby-1.8.6/gc_heap.c
+--- ruby-1.8.6.pristine/gc_heap.c	1969-12-31 17:00:00.000000000 -0700
++++ ruby-1.8.6/gc_heap.c	2007-11-03 00:13:28.000000000 -0600
+@@ -0,0 +1,324 @@
++#include "gc_heap.h"
++#include <stdlib.h>
++#include <assert.h>
++#include <string.h>
++#include <stdio.h>
++
++
++static unsigned int s_slot_size = 0;
++static rb_heap_stats s_stats = { 0,0,0,0,0 };
++
++/* tiny little heaps */
++#define HEAP_SIZE 0x800
++
++typedef struct 
++{
++    unsigned long flags;
++    void * next;
++} heap_entry;
++
++typedef struct 
++{
++    unsigned long num_slots;
++} heap_header;
++
++static unsigned int s_cur_free_heap = 0;
++
++#define HEAP_SPACE_START(h) (((void *) h) + sizeof(heap_header))
++#define HEAP_SPACE_END(h) (((void *) h) + sizeof(heap_header) + (h->num_slots * s_slot_size))
++
++#define SLOT_IN_HEAP(s, h) (((void *) s >= ((void *) h + sizeof(heap_header))) && \
++                            ((void *) s < ((void *) h + HEAP_SIZE)))
++
++// array of heaps
++static heap_header ** s_heaps;
++// number of entries in array
++static unsigned long heaps_arr_size = 0;
++static unsigned long num_heaps = 0;
++static heap_entry * s_freelist;
++
++void
++dump_heap_info(void)
++{
++    unsigned long n;
++
++    printf("num_heaps/used slots: %lu, %lu\n", num_heaps,
++           s_stats.usedSlots);
++
++    for (n=0; n<num_heaps; n++) {
++        heap_entry * fl;        
++        printf("heap %lu: %lu/%lu (%lu)\n", n, 0, s_heaps[n]->num_slots, 0, 0);
++    }
++}
++
++static heap_header * s_free_heaps = NULL;
++
++static void 
++add_heap()
++{
++    if (heaps_arr_size <= num_heaps) {
++        heaps_arr_size += 20;
++        s_heaps = (heap_header **)
++            realloc((void *) s_heaps,
++                    sizeof(heap_header *) * heaps_arr_size);
++    }
++
++    heap_header * heap = NULL;
++    if (s_free_heaps) {
++        heap = s_free_heaps;
++        s_free_heaps = *((heap_header **) heap);
++        memset((void *) heap, 0, HEAP_SIZE);
++    } else {
++        heap = calloc(1, HEAP_SIZE);
++    }
++
++    heap_header ** spot = NULL;
++    // where do we put it?
++    int l = 0, r = num_heaps - 1;
++
++    if (num_heaps) {
++        while (spot == NULL) {
++            unsigned int m;
++
++            if (l >= r) {
++                spot = s_heaps + l;
++                if (*spot < heap) spot++;
++            } else {
++                m = (l+r)/2;
++                
++                if (heap < s_heaps[m]) {
++                    r = m - 1;
++                } else {
++                    l = m + 1;
++                }            
++            }
++        }
++    } else {
++        spot = s_heaps;
++    }
++    
++    // make space
++    int hl = (spot - s_heaps);
++    
++    int x = num_heaps - ((spot - s_heaps));
++
++    x *= sizeof(void *);
++
++    memmove((void *) (spot + 1),
++            (void *) (spot), 
++            x);
++
++    // plunk it in
++    *spot = heap;
++
++    heap->num_slots = (HEAP_SIZE - sizeof(heap_header)) / s_slot_size;
++
++    // now set up the free list
++    void * p = HEAP_SPACE_START(heap);
++    void * pend = HEAP_SPACE_END(heap);    
++    while (p < pend) {
++        ((heap_entry *) p)->next = s_freelist;
++        s_freelist = p;
++        p += s_slot_size;
++    }
++
++    s_stats.currentMem += HEAP_SIZE;
++    if (s_stats.currentMem > s_stats.maxMem)
++        s_stats.maxMem = s_stats.currentMem;
++    s_stats.freeSlots += heap->num_slots;
++    s_stats.totalSlots += heap->num_slots;
++    s_stats.heapsUsed++;
++
++    num_heaps++;
++}
++
++void
++rb_heap_init(unsigned int slot_size)
++{
++    assert(slot_size != 0);
++    assert(s_slot_size == 0);    
++    s_slot_size = slot_size;
++    add_heap();
++}
++
++int
++rb_heap_iterator_next(void ** context, void ** begin, void ** end)
++{
++    unsigned long n = 0;
++    
++    if (*context != NULL) 
++    {
++        n  = (*context - (void *) s_heaps) / sizeof(void *);
++    }
++
++    if (n >= num_heaps) return 0;
++    
++    *begin = HEAP_SPACE_START(s_heaps[n]);
++    *end = HEAP_SPACE_END(s_heaps[n]);    
++
++    *context = s_heaps + n + 1;
++
++    return 1;
++}
++
++void *
++rb_heap_get_slot(void)
++{
++    void * slot;
++    
++    if (!s_freelist) add_heap();
++    assert(s_freelist != NULL);
++    
++    slot = s_freelist;
++    s_freelist = ((heap_entry *) slot)->next;
++
++/*    memset(slot, 0, s_slot_size); */
++
++    s_stats.freeSlots--;
++    s_stats.usedSlots++;
++    
++    return slot;
++}
++
++static heap_header *
++get_heap_from_slot(void * slot)
++{
++    int l = 0, r = num_heaps - 1;
++
++    heap_header * hh = NULL;
++
++    while (num_heaps) {
++        unsigned int m;
++        if (l > r) break;
++        m = (l+r)/2;            
++
++        if (SLOT_IN_HEAP(slot, s_heaps[m])) {
++            hh = s_heaps[m];
++            break;
++        }
++        if (l == r) break;
++        if (slot < (void*) s_heaps[m]) r = m - 1;
++        else                   l = m + 1;
++    }
++
++    if (hh) {
++        hh = (((slot - ((void *) hh + sizeof(heap_header)))
++               % s_slot_size) == 0) ? hh : NULL;
++    }
++
++    return hh;
++}
++
++
++void
++rb_heap_release_slot(void * slot)
++{
++    static unsigned long num_releases;
++
++    ((heap_entry *) slot)->flags = 0;
++    ((heap_entry *) slot)->next = s_freelist;
++    s_freelist = slot;
++
++//    s_cur_free_heap = 0;
++
++    s_stats.freeSlots++;
++    s_stats.usedSlots--;
++}
++
++int
++rb_heap_on_heap_p(void * slot)
++{
++    return get_heap_from_slot(slot) != NULL;
++}
++
++void
++rb_heap_get_stats(rb_heap_stats * stats)
++{
++    assert(stats != NULL);
++    memcpy((void *) stats, (void *) &s_stats, sizeof(s_stats));
++}
++
++double
++rb_heap_get_used_percentage()
++{
++    return (s_stats.usedSlots / (double) s_stats.totalSlots);
++}
++
++unsigned long
++rb_heap_used_slots()
++{
++    return s_stats.usedSlots;
++}
++
++unsigned long
++rb_heap_total_mem()
++{
++    return s_stats.currentMem;
++}
++
++static void
++rebuild_freelist()
++{
++    void * ctx = NULL;
++    void *p, *pend;
++
++    s_freelist = NULL;
++    
++    while (rb_heap_iterator_next(&ctx, &p, &pend)) {
++        while (p < pend) {
++            heap_entry * he = (heap_entry *) p;
++            if (!he->flags) {
++                he->next = s_freelist;
++                s_freelist = he;
++            }
++            p += s_slot_size;
++        }
++    }
++}
++
++void
++rb_heap_compact()
++{
++    /* clean up some heaps if possible */
++    s_cur_free_heap = 0; 
++
++    unsigned int before = num_heaps;
++    unsigned int i = 0;
++
++    for (i=0;i<num_heaps;i++) {
++        void * p = HEAP_SPACE_START(s_heaps[i]);
++        void * pend = HEAP_SPACE_END(s_heaps[i]);        
++        unsigned int used = 0;
++        while (p < pend) {
++            heap_entry * he = (heap_entry *) p;
++            if (he->flags) {
++                used++;
++                break;
++            }
++            p += s_slot_size;
++        }
++        
++        if (!used) {
++            s_stats.currentMem -= HEAP_SIZE;
++            s_stats.freeSlots -= s_heaps[i]->num_slots;
++            s_stats.totalSlots -= s_heaps[i]->num_slots;
++            s_stats.heapsUsed--;
++
++            // add heap to free list
++/*             *((heap_header **) s_heaps[i]) = s_free_heaps; */
++/*             s_free_heaps = s_heaps[i]; */
++            free(s_heaps[i]);
++
++            memmove((void *) (s_heaps + i),
++                    (void *) (s_heaps + i + 1), 
++                    (num_heaps - (i + 1)) * sizeof(void *));
++            num_heaps--;
++
++            i--;
++        } 
++    }
++
++    if (num_heaps != before) {
++        rebuild_freelist();
++    }
++}
+diff -x .svn -urN ruby-1.8.6.pristine/gc_heap.h ruby-1.8.6/gc_heap.h
+--- ruby-1.8.6.pristine/gc_heap.h	1969-12-31 17:00:00.000000000 -0700
++++ ruby-1.8.6/gc_heap.h	2007-11-03 00:21:31.000000000 -0600
+@@ -0,0 +1,49 @@
++/**********************************************************************
++  gc_heap.h -
++
++  $Author: $
++  $Date:  $
++  created at: Fri Nov  2 11:33:06 MDT 2007
++
++  Copyright (C) 2007  Lloyd Hilaiel
++
++**********************************************************************/
++
++#ifndef GC_HEAP_H
++#define GC_HEAP_H
++
++void rb_heap_init(unsigned int slot_size);
++
++int rb_heap_iterator_next(void ** ctx, void ** begin, void ** end);
++
++/* allocate a slot in the heap */
++void *rb_heap_get_slot(void);
++
++/* release a slot back to the heap */
++void rb_heap_release_slot(void * slot);
++
++int rb_heap_on_heap_p(void * slot);
++
++typedef struct rb_heap_stats_t {
++    unsigned long currentMem;
++    unsigned long maxMem;
++    unsigned long totalSlots;
++    unsigned long freeSlots;
++    unsigned long usedSlots;
++    unsigned long heapsUsed;
++} rb_heap_stats;
++
++void rb_heap_get_stats(rb_heap_stats * stats);
++
++double rb_heap_get_used_percentage();
++
++unsigned long rb_heap_used_slots();
++
++void rb_heap_compact();
++
++unsigned long rb_heap_total_mem();
++
++void dump_heap_info(void);
++
++#endif
++ 
+diff -x .svn -urN ruby-1.8.6.pristine/intern.h ruby-1.8.6/intern.h
+--- ruby-1.8.6.pristine/intern.h	2007-03-11 01:31:53.000000000 -0700
++++ ruby-1.8.6/intern.h	2007-11-03 00:25:33.000000000 -0600
+@@ -190,6 +190,7 @@
+ void rb_mark_end_proc _((void));
+ void rb_exec_end_proc _((void));
+ void ruby_finalize _((void));
++
+ NORETURN(void ruby_stop _((int)));
+ int ruby_cleanup _((int));
+ int ruby_exec _((void));
+@@ -250,6 +251,7 @@
+ VALUE rb_gc_enable _((void));
+ VALUE rb_gc_disable _((void));
+ VALUE rb_gc_start _((void));
++
+ /* hash.c */
+ void st_foreach_safe _((struct st_table *, int (*)(ANYARGS), unsigned long));
+ void rb_hash_foreach _((VALUE, int (*)(ANYARGS), VALUE));

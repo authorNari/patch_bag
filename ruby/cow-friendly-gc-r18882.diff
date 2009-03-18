@@ -1,0 +1,957 @@
+Index: debug.c
+===================================================================
+--- debug.c	(revision 18882)
++++ debug.c	(working copy)
+@@ -31,7 +31,7 @@
+         RUBY_ENC_CODERANGE_7BIT    = ENC_CODERANGE_7BIT,
+         RUBY_ENC_CODERANGE_VALID   = ENC_CODERANGE_VALID,
+         RUBY_ENC_CODERANGE_BROKEN  = ENC_CODERANGE_BROKEN, 
+-        RUBY_FL_MARK        = FL_MARK,
++        RUBY_FL_ALLOCATED   = FL_ALLOCATED,
+         RUBY_FL_RESERVED    = FL_RESERVED,
+         RUBY_FL_FINALIZE    = FL_FINALIZE,
+         RUBY_FL_TAINT       = FL_TAINT,
+Index: include/ruby/ruby.h
+===================================================================
+--- include/ruby/ruby.h	(revision 18882)
++++ include/ruby/ruby.h	(working copy)
+@@ -758,7 +758,7 @@
+ #define RCOMPLEX(obj) (R_CAST(RComplex)(obj))
+ 
+ #define FL_SINGLETON FL_USER0
+-#define FL_MARK      (((VALUE)1)<<5)
++#define FL_ALLOCATED (((VALUE)1)<<5)
+ #define FL_RESERVED  (((VALUE)1)<<6) /* will be used in the future GC */
+ #define FL_FINALIZE  (((VALUE)1)<<7)
+ #define FL_TAINT     (((VALUE)1)<<8)
+@@ -854,6 +854,7 @@
+ void rb_register_mark_object(VALUE);
+ void rb_gc_register_address(VALUE*);
+ void rb_gc_unregister_address(VALUE*);
++int rb_gc_is_thread_marked(VALUE);
+ 
+ ID rb_intern(const char*);
+ ID rb_intern2(const char*, long);
+Index: pointerset.c
+===================================================================
+--- pointerset.c	(revision 0)
++++ pointerset.c	(revision 0)
+@@ -0,0 +1,246 @@
++#include "ruby.h"
++#ifdef HAVE_STDLIB_H
++	#include <stdlib.h>
++#endif
++#include <string.h>
++#include "pointerset.h"
++
++
++typedef struct _PointerSetEntry PointerSetEntry;
++
++struct _PointerSet {
++	unsigned int num_bins;
++	unsigned int num_entries;
++	PointerSetEntry **bins;
++};
++
++struct _PointerSetEntry {
++	PointerSetElement element;
++	PointerSetEntry *next;
++};
++
++/* Table of prime numbers 2^n+a, 2<=n<=30. */
++static const long primes[] = {
++	8 + 3,
++	16 + 3,
++	32 + 5,
++	64 + 3,
++	128 + 3,
++	256 + 27,
++	512 + 9,
++	1024 + 9,
++	2048 + 5,
++	4096 + 3,
++	8192 + 27,
++	16384 + 43,
++	32768 + 3,
++	65536 + 45,
++	131072 + 29,
++	262144 + 3,
++	524288 + 21,
++	1048576 + 7,
++	2097152 + 17,
++	4194304 + 15,
++	8388608 + 9,
++	16777216 + 43,
++	33554432 + 35,
++	67108864 + 15,
++	134217728 + 29,
++	268435456 + 3,
++	536870912 + 11,
++	1073741824 + 85,
++	0
++};
++
++
++/* The percentage of nonempty buckets, before increasing the number of bins. 1.0 == 100%
++ * A value larger than 1.0 means that it's very likely that some buckets contain more than
++ * 1 entry.
++ */
++#define MAX_LOAD_FACTOR 2.0
++/* The default for the number of bins allocated initially. Must be a prime number. */
++#define DEFAULT_TABLE_SIZE 11
++/* MINSIZE is the minimum size of a dictionary. */
++#define MINSIZE 8
++
++#if SIZEOF_LONG == SIZEOF_VOIDP
++	typedef unsigned long PointerInt;
++#elif SIZEOF_LONG_LONG == SIZEOF_VOIDP
++	typedef unsigned LONG_LONG PointerInt;
++#else
++	#error ---->> pointerset.c requires sizeof(void*) == sizeof(long) to be compiled. <<---
++	-
++#endif
++
++#define alloc(type) (type*)malloc((unsigned)sizeof(type))
++#define Calloc(n,s) (char*)calloc((n),(s))
++
++#define HASH(element, num_bins) ((PointerInt) element) % num_bins
++#define FIND_ENTRY(set, entry, element) \
++	do { \
++		unsigned int bin_pos = HASH(element, set->num_bins); \
++		entry = (set)->bins[bin_pos]; \
++		while (entry != NULL && entry->element != element) { \
++			entry = entry->next; \
++		} \
++	} while (0)
++
++
++static int
++new_size(int size)
++{
++	int i;
++	int newsize;
++
++	for (i = 0, newsize = MINSIZE;
++	     i < sizeof(primes)/sizeof(primes[0]);
++	     i++, newsize <<= 1)
++	{
++		if (newsize > size)
++			return primes[i];
++	}
++	/* Ran out of polynomials */
++	return -1;	/* should raise exception */
++}
++
++PointerSet *
++pointer_set_new()
++{
++	PointerSet *set;
++
++	set = alloc(PointerSet);
++	if (set != NULL) {
++		set->num_entries = 0;
++		set->num_bins = DEFAULT_TABLE_SIZE;
++		set->bins = (PointerSetEntry **) Calloc(DEFAULT_TABLE_SIZE, sizeof(PointerSetEntry *));
++	}
++	return set;
++}
++
++static void
++free_bin_contents(PointerSet *set)
++{
++	PointerSetEntry *entry, *next;
++	int i;
++
++	for(i = 0; i < set->num_bins; i++) {
++		entry = set->bins[i];
++		while (entry != NULL) {
++			next = entry->next;
++			free(entry);
++			entry = next;
++		}
++		set->bins[i] = NULL;
++	}
++	set->num_entries = 0;
++}
++
++void
++pointer_set_free(PointerSet *set)
++{
++	free_bin_contents(set);
++	free(set->bins);
++	free(set);
++}
++
++int
++pointer_set_contains(PointerSet *set, PointerSetElement element)
++{
++	PointerSetEntry *entry;
++	FIND_ENTRY(set, entry, element);
++	return entry != NULL;
++}
++
++static void
++rehash(PointerSet *set, int new_num_bins)
++{
++	PointerSetEntry *entry, **new_bins;
++	int i;
++
++	new_bins = (PointerSetEntry **) Calloc(new_num_bins, sizeof(PointerSetEntry *));
++	for (i = 0; i < set->num_bins; i++) {
++		entry = set->bins[i];
++		while (entry != NULL) {
++			unsigned int new_bin_pos;
++			PointerSetEntry *next;
++
++			new_bin_pos = HASH(entry->element, new_num_bins);
++			next = entry->next;
++			entry->next = new_bins[new_bin_pos];
++			new_bins[new_bin_pos] = entry;
++			entry = next;
++		}
++	}
++	free(set->bins);
++	set->num_bins = new_num_bins;
++	set->bins = new_bins;
++}
++
++void
++pointer_set_insert(PointerSet *set, PointerSetElement element)
++{
++	PointerSetEntry *entry;
++
++	FIND_ENTRY(set, entry, element);
++	if (entry == NULL) {
++		unsigned int bin_pos;
++
++		if (set->num_entries / (double) set->num_bins > MAX_LOAD_FACTOR) {
++			/* Increase number of bins to the next prime number. */
++			rehash(set, new_size(set->num_bins + 1));
++		}
++
++		bin_pos = HASH(element, set->num_bins);
++		entry = malloc(sizeof(PointerSetEntry));
++		entry->element = element;
++		entry->next = set->bins[bin_pos];
++		set->bins[bin_pos] = entry;
++		set->num_entries++;
++	}
++}
++
++void
++pointer_set_delete(PointerSet *set, PointerSetElement element)
++{
++	unsigned int bin_pos;
++	PointerSetEntry *entry, *prev;
++
++	bin_pos = HASH(element, set->num_bins);
++	entry = set->bins[bin_pos];
++	prev = NULL;
++	while (entry != NULL && entry->element != element) {
++		prev = entry;
++		entry = entry->next;
++	}
++	if (entry != NULL) {
++		if (prev != NULL) {
++			prev->next = entry->next;
++		} else {
++			set->bins[bin_pos] = entry->next;
++		}
++		free(entry);
++		set->num_entries--;
++		/* TODO: is it a good idea to reduce the number of bins? */
++	}
++}
++
++void
++pointer_set_reset(PointerSet *set)
++{
++	free_bin_contents(set);
++	set->bins = realloc(set->bins, sizeof(PointerSetEntry *) * DEFAULT_TABLE_SIZE);
++	set->num_bins = DEFAULT_TABLE_SIZE;
++	memset(set->bins, 0, sizeof(PointerSetEntry *) * DEFAULT_TABLE_SIZE);
++}
++
++unsigned int
++pointer_set_get_size(PointerSet *set)
++{
++	return set->num_entries;
++}
++
++unsigned int
++pointer_set_get_capacity(PointerSet *set)
++{
++	return set->num_bins;
++}
+Index: pointerset.h
+===================================================================
+--- pointerset.h	(revision 0)
++++ pointerset.h	(revision 0)
+@@ -0,0 +1,17 @@
++#ifndef _POINTER_SET_H_
++#define _POINTER_SET_H_
++
++typedef void * PointerSetElement;
++typedef struct _PointerSet PointerSet;
++
++PointerSet   *pointer_set_new();
++void         pointer_set_free(PointerSet *set);
++
++void         pointer_set_insert(PointerSet *set, PointerSetElement element);
++void         pointer_set_delete(PointerSet *set, PointerSetElement element);
++int          pointer_set_contains(PointerSet *set, PointerSetElement element);
++void         pointer_set_reset(PointerSet *set);
++unsigned int pointer_set_get_size(PointerSet *set);
++unsigned int pointer_set_get_capacity(PointerSet *set);
++
++#endif /* _POINTER_SET_H_ */
+Index: common.mk
+===================================================================
+--- common.mk	(revision 18882)
++++ common.mk	(working copy)
+@@ -48,6 +48,7 @@
+ 		object.$(OBJEXT) \
+ 		pack.$(OBJEXT) \
+ 		parse.$(OBJEXT) \
++		pointerset.$(OBJEXT) \
+ 		process.$(OBJEXT) \
+ 		prec.$(OBJEXT) \
+ 		random.$(OBJEXT) \
+@@ -486,7 +487,7 @@
+   {$(VPATH)}encoding.h {$(VPATH)}vm_core.h {$(VPATH)}debug.h \
+   {$(VPATH)}vm_opts.h $(ID_H_INCLUDES) \
+   {$(VPATH)}thread_$(THREAD_MODEL).h \
+-  {$(VPATH)}gc.h {$(VPATH)}eval_intern.h
++  {$(VPATH)}gc.h {$(VPATH)}pointerset.h {$(VPATH)}eval_intern.h
+ hash.$(OBJEXT): {$(VPATH)}hash.c $(RUBY_H_INCLUDES) \
+   $(ID_H_INCLUDES) \
+   {$(VPATH)}st.h {$(VPATH)}util.h {$(VPATH)}signal.h
+@@ -515,6 +516,7 @@
+   {$(VPATH)}regenc.h {$(VPATH)}regex.h {$(VPATH)}util.h \
+   {$(VPATH)}lex.c {$(VPATH)}keywords {$(VPATH)}debug.h
+ prec.$(OBJEXT): {$(VPATH)}prec.c $(RUBY_H_INCLUDES) {$(VPATH)}st.h
++pointerset.$(OBJEXT): {$(VPATH)}pointerset.c
+ proc.$(OBJEXT): {$(VPATH)}proc.c {$(VPATH)}eval_intern.h \
+   $(RUBY_H_INCLUDES) {$(VPATH)}st.h {$(VPATH)}node.h \
+   {$(VPATH)}util.h {$(VPATH)}signal.h {$(VPATH)}vm_core.h \
+Index: gc.c
+===================================================================
+--- gc.c	(revision 18882)
++++ gc.c	(working copy)
+@@ -23,8 +23,14 @@
+ #include "gc.h"
+ #include <stdio.h>
+ #include <setjmp.h>
++#include <math.h>
+ #include <sys/types.h>
+ 
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
+ #ifdef HAVE_SYS_TIME_H
+ #include <sys/time.h>
+ #endif
+@@ -93,7 +99,7 @@
+ #undef GC_DEBUG
+ 
+ /* for GC profile */
+-#define GC_PROFILE_MORE_DETAIL 0
++#define GC_PROFILE_MORE_DETAIL 1
+ typedef struct gc_profile_record {
+     double gc_time;
+     double gc_mark_time;
+@@ -285,6 +291,8 @@
+     void *membase;
+     RVALUE *slot;
+     int limit;
++    int *marks;
++    int marks_size;
+ };
+ 
+ #define HEAP_MIN_SLOTS 10000
+@@ -674,7 +682,83 @@
+       vm_xfree(&rb_objspace, x);
+ }
+ 
++static int debugging = 0;
+ 
++#define DEBUG_POINT(message) \
++	do { \
++		if (debugging) { \
++			printf("%s\n", message); \
++			getchar(); \
++		} \
++	} while (0)
++
++#define OPTION_ENABLED(name) (getenv((name)) && *getenv((name)) && *getenv((name)) != '0')
++
++typedef struct {
++    int fd;
++    size_t size;
++} FileHeapAllocatorMetaData;
++
++static void *
++alloc_ruby_heap_with_file(size_t size)
++{
++    FileHeapAllocatorMetaData meta;
++    meta.fd = open("/dev/zero", O_RDONLY);
++    meta.size = size;
++    if (meta.fd == -1) {
++	return NULL;
++    }
++    else {
++	void *memory = mmap(NULL, size + sizeof(meta), PROT_READ | PROT_WRITE,
++	                    MAP_PRIVATE, meta.fd, 0);
++	if (memory == NULL) {
++	    return NULL;
++	}
++	else {
++	    FileHeapAllocatorMetaData *p = (FileHeapAllocatorMetaData *) memory;
++	    *p = meta;
++	    return p + 1;
++	}
++    }
++}
++
++static void *
++alloc_ruby_heap(size_t size)
++{
++    if (debugging || OPTION_ENABLED("RUBY_GC_ALLOC_HEAP_WITH_FILE")) {
++	return alloc_ruby_heap_with_file(size);
++    }
++    else {
++	return malloc(size);
++    }
++}
++
++static void
++free_ruby_heap_with_file(void *heap)
++{
++    FileHeapAllocatorMetaData *p = (FileHeapAllocatorMetaData *) heap;
++    close(p->fd);
++    munmap(p, p->size);
++}
++
++static void
++free_ruby_heap(void *heap)
++{
++    if (debugging || OPTION_ENABLED("RUBY_GC_ALLOC_HEAP_WITH_FILE")) {
++	free_ruby_heap_with_file(heap);
++    }
++    else {
++	free(heap);
++    }
++}
++
++static void
++init_debugging()
++{
++    debugging = OPTION_ENABLED("RUBY_GC_DEBUG");
++}
++
++
+ /*
+  *  call-seq:
+  *     GC.enable    => true or false
+@@ -764,8 +848,158 @@
+     }
+ }
+ 
++#include "pointerset.h"
+ 
++/* A mark table for filenames and objects that are not on the heap. */
++static PointerSet *mark_table = NULL;
++static struct heaps_slot *last_heap = NULL;
++
++
++static inline struct heaps_slot *
++find_heap_slot_for_object(rb_objspace_t *objspace, RVALUE *object)
++{
++    int i;
++
++    /* Look in the cache first. */
++    if (last_heap != NULL && object >= last_heap->slot
++	&& object < last_heap->slot + last_heap->limit) {
++	return last_heap;
++    }
++    for (i = 0; i < heaps_used; i++) {
++	struct heaps_slot *heap = &heaps[i];
++	if (object >= heap->slot
++	    && object < heap->slot + heap->limit) {
++	    /* Cache this result. According to empirical evidence, the chance is
++	     * high that the next lookup will be for the same heap slot.
++	     */
++	    last_heap = heap;
++	    return heap;
++	}
++    }
++    return NULL;
++}
++
++static inline void
++find_position_in_bitfield(struct heaps_slot *hs, RVALUE *object,
++                          unsigned int *bitfield_index, unsigned int *bitfield_offset)
++{
++    unsigned int index;
++
++    index = object - hs->slot;
++    *bitfield_index = index / (sizeof(int) * 8);
++    *bitfield_offset = index % (sizeof(int) * 8);
++}
++
++
++
+ static void
++rb_mark_table_init()
++{
++    mark_table = pointer_set_new();
++}
++
++static void
++rb_mark_table_prepare()
++{
++    last_heap = NULL;
++}
++
++static void
++rb_mark_table_finalize(rb_objspace_t *objspace)
++{
++    int i;
++
++    if (pointer_set_get_size(mark_table) > 0) {
++	pointer_set_reset(mark_table);
++    }
++    for (i = 0; i < heaps_used; i++) {
++	memset(heaps[i].marks, 0, heaps[i].marks_size * sizeof(int));
++    }
++}
++
++static void
++rb_mark_table_add(rb_objspace_t *objspace, RVALUE *object)
++{
++    struct heaps_slot *hs;
++    unsigned int bitfield_index, bitfield_offset;
++
++    hs = find_heap_slot_for_object(objspace, object);
++    if (hs != NULL) {
++	find_position_in_bitfield(hs, object, &bitfield_index, &bitfield_offset);
++	hs->marks[bitfield_index] |= (1 << bitfield_offset);
++    }
++    else {
++	pointer_set_insert(mark_table, (void *) object);
++    }
++}
++
++static int
++rb_mark_table_contains(rb_objspace_t *objspace, RVALUE *object)
++{
++    struct heaps_slot *hs;
++    unsigned int bitfield_index, bitfield_offset;
++
++    hs = find_heap_slot_for_object(objspace, object);
++    if (hs != NULL) {
++	find_position_in_bitfield(hs, object, &bitfield_index, &bitfield_offset);
++	return hs->marks[bitfield_index] & (1 << bitfield_offset);
++    }
++    else {
++	return pointer_set_contains(mark_table, (void *) object);
++    }
++}
++
++static int
++rb_mark_table_heap_contains(struct heaps_slot *hs, RVALUE *object)
++{
++	unsigned int bitfield_index, bitfield_offset;
++	find_position_in_bitfield(hs, object, &bitfield_index, &bitfield_offset);
++	return hs->marks[bitfield_index] & (1 << bitfield_offset);
++}
++
++static void
++rb_mark_table_remove(rb_objspace_t *objspace, RVALUE *object)
++{
++    struct heaps_slot *hs;
++    unsigned int bitfield_index, bitfield_offset;
++
++    hs = find_heap_slot_for_object(objspace, object);
++    if (hs != NULL) {
++	find_position_in_bitfield(hs, object, &bitfield_index, &bitfield_offset);
++	hs->marks[bitfield_index] &= ~(1 << bitfield_offset);
++    }
++    else {
++	pointer_set_delete(mark_table, (void *) object);
++    }
++}
++
++static void
++rb_mark_table_heap_remove(struct heaps_slot *hs, RVALUE *object)
++{
++    unsigned int bitfield_index, bitfield_offset;
++    find_position_in_bitfield(hs, object, &bitfield_index, &bitfield_offset);
++    hs->marks[bitfield_index] &= ~(1 << bitfield_offset);
++}
++
++static void
++rb_mark_table_add_filename(const char *filename)
++{
++    pointer_set_insert(mark_table, (void *) filename);
++}
++
++static int
++rb_mark_table_contains_filename(const char *filename)
++{
++    return pointer_set_contains(mark_table, (void *) filename);
++}
++
++static void
++rb_mark_table_remove_filename(const char *filename)
++{
++    pointer_set_delete(mark_table, (void *) filename);
++}
++
++static void
+ allocate_heaps(rb_objspace_t *objspace, size_t next_heaps_length)
+ {
+     struct heaps_slot *p;
+@@ -832,6 +1066,8 @@
+     heaps[hi].membase = membase;
+     heaps[hi].slot = p;
+     heaps[hi].limit = objs;
++    heaps[hi].marks_size = (int) (ceil(objs / (sizeof(int) * 8.0)));
++    heaps[hi].marks = (int *) calloc(heaps[hi].marks_size, sizeof(int));
+     pend = p + objs;
+     if (lomem == 0 || lomem > p) lomem = p;
+     if (himem < pend) himem = pend;
+@@ -904,6 +1140,7 @@
+     freelist = freelist->as.free.next;
+ 
+     MEMZERO((void*)obj, RVALUE, 1);
++    RANY(obj)->as.free.flags = FL_ALLOCATED;
+ #ifdef GC_DEBUG
+     RANY(obj)->file = rb_sourcefile();
+     RANY(obj)->line = rb_sourceline();
+@@ -1079,6 +1316,28 @@
+ static void gc_mark(rb_objspace_t *objspace, VALUE ptr, int lev);
+ static void gc_mark_children(rb_objspace_t *objspace, VALUE ptr, int lev);
+ 
++void
++rb_mark_source_filename(char *f)
++{
++    if (f) {
++	rb_mark_table_add_filename(f);
++    }
++}
++
++static int
++sweep_source_filename(char *key, char *value)
++{
++    if (rb_mark_table_contains_filename(value + 1)) {
++	rb_mark_table_remove_filename(value + 1);
++	return ST_CONTINUE;
++    }
++    else {
++	rb_mark_table_remove_filename(value + 1);
++	free(value);
++	return ST_DELETE;
++    }
++}
++
+ static void
+ gc_mark_all(rb_objspace_t *objspace)
+ {
+@@ -1089,8 +1348,8 @@
+     for (i = 0; i < heaps_used; i++) {
+ 	p = heaps[i].slot; pend = p + heaps[i].limit;
+ 	while (p < pend) {
+-	    if ((p->as.basic.flags & FL_MARK) &&
+-		(p->as.basic.flags != FL_MARK)) {
++	    if (rb_mark_table_contains(objspace, p) &&
++		(p->as.basic.flags != FL_ALLOCATED)) {
+ 		gc_mark_children(objspace, (VALUE)p, 0);
+ 	    }
+ 	    p++;
+@@ -1270,8 +1529,8 @@
+     obj = RANY(ptr);
+     if (rb_special_const_p(ptr)) return; /* special const not marked */
+     if (obj->as.basic.flags == 0) return;       /* free cell */
+-    if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+-    obj->as.basic.flags |= FL_MARK;
++    if (rb_mark_table_contains(objspace, obj)) return;  /* already marked */
++    rb_mark_table_add(objspace, obj);
+ 
+     if (lev > GC_LEVEL_MAX || (lev == 0 && ruby_stack_check())) {
+ 	if (!mark_stack_overflow) {
+@@ -1305,8 +1564,8 @@
+     obj = RANY(ptr);
+     if (rb_special_const_p(ptr)) return; /* special const not marked */
+     if (obj->as.basic.flags == 0) return;       /* free cell */
+-    if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+-    obj->as.basic.flags |= FL_MARK;
++    if (rb_mark_table_contains(objspace, obj)) return;  /* already marked */
++    rb_mark_table_add(objspace, obj);
+ 
+   marking:
+     if (FL_TEST(obj, FL_EXIVAR)) {
+@@ -1565,6 +1824,7 @@
+ {
+     VALGRIND_MAKE_MEM_UNDEFINED((void*)p, sizeof(RVALUE));
+     p->as.free.flags = 0;
++    rb_mark_table_remove(objspace, (RVALUE *) p);
+     p->as.free.next = freelist;
+     freelist = p;
+ }
+@@ -1575,7 +1835,11 @@
+     while (p) {
+ 	RVALUE *tmp = p->as.free.next;
+ 	run_final(objspace, (VALUE)p);
+-	if (!FL_TEST(p, FL_SINGLETON)) { /* not freeing page */
++	/* Don't free objects that are singletons, or objects that are already freed.
++	 * The latter is to prevent the unnecessary marking of memory pages as dirty,
++	 * which can destroy copy-on-write semantics.
++	 */
++	if (!FL_TEST(p, FL_SINGLETON) && p->as.free.flags != 0) {
+ 	    add_freelist(objspace, p);
+ 	}
+ 	else {
+@@ -1590,16 +1854,11 @@
+ free_unused_heaps(rb_objspace_t *objspace)
+ {
+     size_t i, j;
+-    RVALUE *last = 0;
+ 
+     for (i = j = 1; j < heaps_used; i++) {
+ 	if (heaps[i].limit == 0) {
+-	    if (!last) {
+-		last = heaps[i].membase;
+-	    }
+-	    else {
+-		free(heaps[i].membase);
+-	    }
++	    free_ruby_heap(heaps[i].membase);
++	    free(heaps[i].marks);
+ 	    heaps_used--;
+ 	}
+ 	else {
+@@ -1609,15 +1868,6 @@
+ 	    j++;
+ 	}
+     }
+-    if (last) {
+-	if (last < heaps_freed) {
+-	    free(heaps_freed);
+-	    heaps_freed = last;
+-	}
+-	else {
+-	    free(last);
+-	}
+-    }
+ }
+ 
+ static void
+@@ -1647,7 +1897,7 @@
+ 
+ 	p = heaps[i].slot; pend = p + heaps[i].limit;
+ 	while (p < pend) {
+-	    if (!(p->as.basic.flags & FL_MARK)) {
++	    if (!rb_mark_table_contains(objspace, p)) {
+ 		if (p->as.basic.flags &&
+ 		    ((deferred = obj_free(objspace, (VALUE)p)) ||
+ 		     ((FL_TEST(p, FL_FINALIZE)) && need_call_final))) {
+@@ -1655,14 +1905,21 @@
+ 			p->as.free.flags = T_DEFERRED;
+ 			RDATA(p)->dfree = 0;
+ 		    }
+-		    p->as.free.flags |= FL_MARK;
++		    rb_mark_table_add(objspace, p); /* remain marked */
+ 		    p->as.free.next = final_list;
+ 		    final_list = p;
+ 		    final_num++;
+ 		}
+ 		else {
+-		    add_freelist(objspace, p);
+-		    free_num++;
++                    VALGRIND_MAKE_MEM_UNDEFINED((void*)p, sizeof(RVALUE));
++		    /* Do not touch the fields if they don't have to be modified.
++		     * This is in order to preserve copy-on-write semantics.
++		     */
++		    if (p->as.free.flags != 0)
++			p->as.free.flags = 0;
++		    if (p->as.free.next != freelist)
++			p->as.free.next = freelist;
++		    freelist = p;
+ 		}
+ 	    }
+ 	    else if (BUILTIN_TYPE(p) == T_DEFERRED) {
+@@ -1670,7 +1927,7 @@
+ 		/* do nothing remain marked */
+ 	    }
+ 	    else {
+-		RBASIC(p)->flags &= ~FL_MARK;
++		rb_mark_table_heap_remove(&heaps[i], p);
+ 		live++;
+ 	    }
+ 	    p++;
+@@ -1709,6 +1966,7 @@
+ 	RUBY_VM_SET_FINALIZER_INTERRUPT(GET_THREAD());
+     }
+     else{
++	rb_mark_table_finalize(objspace);
+ 	free_unused_heaps(objspace);
+ 	GC_PROF_SET_HEAP_INFO;
+     }
+@@ -1916,6 +2174,7 @@
+ 
+     FLUSH_REGISTER_WINDOWS;
+     /* This assumes that all registers are saved into the jmp_buf (and stack) */
++    memset(save_regs_gc_mark, 0, sizeof(save_regs_gc_mark));
+     rb_setjmp(save_regs_gc_mark);
+     mark_locations_array(objspace,
+ 			 (VALUE*)save_regs_gc_mark,
+@@ -1962,6 +2221,7 @@
+     GC_PROF_MARK_TIMER_START;
+     SET_STACK_END;
+ 
++    rb_mark_table_prepare();
+     init_mark_stack(objspace);
+ 
+     th->vm->self ? rb_gc_mark(th->vm->self) : rb_vm_mark(th->vm);
+@@ -2058,6 +2318,20 @@
+ 
+ #undef Init_stack
+ 
++int
++rb_gc_is_thread_marked(the_thread)
++    VALUE the_thread;
++{
++    rb_objspace_t *objspace = &rb_objspace;
++
++    if (FL_ABLE(the_thread)) {
++	return rb_mark_table_contains(objspace, (RVALUE *) the_thread);
++    }
++    else {
++	return 0;
++    }
++}
++
+ void
+ Init_stack(VALUE *addr)
+ {
+@@ -2098,6 +2372,7 @@
+ void
+ Init_heap(void)
+ {
++    rb_mark_table_init();
+     init_heap(&rb_objspace);
+ }
+ 
+@@ -2325,10 +2600,13 @@
+ static int
+ chain_finalized_object(st_data_t key, st_data_t val, st_data_t arg)
+ {
++    rb_objspace_t *objspace = &rb_objspace;
++
+     RVALUE *p = (RVALUE *)key, **final_list = (RVALUE **)arg;
+     if (p->as.basic.flags & FL_FINALIZE) {
+ 	if (BUILTIN_TYPE(p) != T_DEFERRED) {
+-	    p->as.free.flags = FL_MARK | T_DEFERRED; /* remain marked */
++	    p->as.free.flags = FL_ALLOCATED | T_DEFERRED; /* remain marked */
++	    rb_mark_table_add(objspace, p);
+ 	    RDATA(p)->dfree = 0;
+ 	}
+ 	p->as.free.next = *final_list;
+@@ -2375,6 +2653,7 @@
+ 		DATA_PTR(p) && RANY(p)->as.data.dfree &&
+ 		RANY(p)->as.basic.klass != rb_cThread) {
+ 		p->as.free.flags = 0;
++		rb_mark_table_remove(objspace, p);
+ 		if ((long)RANY(p)->as.data.dfree == -1) {
+ 		    xfree(DATA_PTR(p));
+ 		}
+@@ -2386,6 +2665,7 @@
+ 	    else if (BUILTIN_TYPE(p) == T_FILE) {
+ 		if (rb_io_fptr_finalize(RANY(p)->as.file.fptr)) {
+ 		    p->as.free.flags = 0;
++		    rb_mark_table_remove(objspace, p);
+                     VALGRIND_MAKE_MEM_UNDEFINED((void*)p, sizeof(RVALUE));
+ 		}
+ 	    }
+@@ -2633,6 +2913,61 @@
+     return hash;
+ }
+ 
++static VALUE
++os_statistics()
++{
++    int i;
++    unsigned int objects = 0;
++    unsigned int total_heap_size = 0;
++    unsigned int ast_nodes = 0;
++    char message[1024];
++    rb_objspace_t *objspace = &rb_objspace;
++
++    for (i = 0; i < heaps_used; i++) {
++	RVALUE *p, *pend;
++
++	p = heaps[i].slot;
++	pend = p + heaps[i].limit;
++	for (;p < pend; p++) {
++	    if (p->as.basic.flags) {
++		int isAST = 0;
++		switch (TYPE(p)) {
++		  case T_ICLASS:
++		  case T_NODE:
++		    isAST = 1;
++		    break;
++		  case T_CLASS:
++		    if (FL_TEST(p, FL_SINGLETON)) {
++		        isAST = 1;
++		        break;
++		    }
++		  default:
++		    break;
++		}
++		objects++;
++		if (isAST) {
++		   ast_nodes++;
++		}
++	    }
++	}
++	total_heap_size += (void *) pend - heaps[i].membase;
++    }
++
++    snprintf(message, sizeof(message),
++        "Number of objects: %d (%d AST nodes, %.2f%%)\n"
++        "Heap slot size: %d\n"
++        "Number of heaps: %d\n"
++        "Total size of objects: %.2f KB\n"
++        "Total size of heaps: %.2f KB\n",
++        objects, ast_nodes, ast_nodes * 100 / (double) objects,
++        sizeof(RVALUE),
++        heaps_used,
++        objects * sizeof(RVALUE) / 1024.0,
++        total_heap_size / 1024.0
++    );
++    return rb_str_new2(message);
++}
++
+ /*
+  *  call-seq:
+  *     GC.count -> Integer
+@@ -2834,6 +3169,8 @@
+ 
+     rb_define_module_function(rb_mObSpace, "_id2ref", id2ref, 1);
+ 
++    rb_define_module_function(rb_mObSpace, "statistics", os_statistics, 0);
++
+     nomem_error = rb_exc_new3(rb_eNoMemError,
+ 			      rb_obj_freeze(rb_str_new2("failed to allocate memory")));
+     OBJ_TAINT(nomem_error);
+@@ -2844,6 +3181,7 @@
+     rb_define_method(rb_mKernel, "object_id", rb_obj_id, 0);
+ 
+     rb_define_module_function(rb_mObSpace, "count_objects", count_objects, -1);
++    init_debugging();
+ 
+ #if CALC_EXACT_MALLOC_SIZE
+     rb_define_singleton_method(rb_mGC, "malloc_allocated_size", gc_malloc_allocated_size, 0);

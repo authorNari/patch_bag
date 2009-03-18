@@ -1,0 +1,149 @@
+Index: gc.c
+===================================================================
+--- gc.c	(リビジョン 22947)
++++ gc.c	(作業コピー)
+@@ -265,6 +265,7 @@
+ 	struct RRational rational;
+ 	struct RComplex complex;
+     } as;
++    size_t lifetime;
+ #ifdef GC_DEBUG
+     char *file;
+     int   line;
+@@ -909,6 +910,7 @@
+ 
+     while (p < pend) {
+ 	p->as.free.flags = 0;
++	p->lifetime = 0;
+ 	p->as.free.next = freelist;
+ 	freelist = p;
+ 	p++;
+@@ -974,6 +976,8 @@
+     freelist = freelist->as.free.next;
+ 
+     MEMZERO((void*)obj, RVALUE, 1);
++
++    RANY(obj)->lifetime = 0;
+ #ifdef GC_DEBUG
+     RANY(obj)->file = rb_sourcefile();
+     RANY(obj)->line = rb_sourceline();
+@@ -1352,6 +1356,7 @@
+     if (obj->as.basic.flags == 0) return;       /* free cell */
+     if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+     obj->as.basic.flags |= FL_MARK;
++    obj->lifetime++;
+ 
+     if (lev > GC_LEVEL_MAX || (lev == 0 && stack_check())) {
+ 	if (!mark_stack_overflow) {
+@@ -1649,6 +1654,7 @@
+ {
+     VALGRIND_MAKE_MEM_UNDEFINED((void*)p, sizeof(RVALUE));
+     p->as.free.flags = 0;
++    p->lifetime = 0;
+     p->as.free.next = freelist;
+     freelist = p;
+ }
+@@ -2699,7 +2705,87 @@
+         if (counts[i])
+             rb_hash_aset(hash, type, SIZET2NUM(counts[i]));
+     }
++    return hash;
++}
+ 
++static VALUE
++count_object_lifetimes(int argc, VALUE *argv, VALUE os)
++{
++    rb_objspace_t *objspace = &rb_objspace;
++    size_t counts[T_MASK+1];
++    size_t counts2[T_MASK+1];
++    size_t freed = 0;
++    size_t total = 0;
++    size_t i;
++    VALUE hash;
++
++    if (rb_scan_args(argc, argv, "01", &hash) == 1) {
++        if (TYPE(hash) != T_HASH)
++            rb_raise(rb_eTypeError, "non-hash given");
++    }
++
++    for (i = 0; i <= T_MASK; i++) {
++        counts[i] = 0;
++        counts2[i] = 0;
++    }
++
++    for (i = 0; i < heaps_used; i++) {
++        RVALUE *p, *pend;
++
++        p = heaps[i].slot; pend = p + heaps[i].limit;
++        for (;p < pend; p++) {
++            if (p->as.basic.flags) {
++                counts[BUILTIN_TYPE(p)]++;
++                counts2[BUILTIN_TYPE(p)] += p->lifetime;
++            }
++        }
++    }
++
++    if (hash == Qnil) {
++        hash = rb_hash_new();
++    }
++    else if (!RHASH_EMPTY_P(hash)) {
++        st_foreach(RHASH_TBL(hash), set_zero, hash);
++    }
++    rb_hash_aset(hash, ID2SYM(rb_intern("TOTAL")), SIZET2NUM(total));
++    rb_hash_aset(hash, ID2SYM(rb_intern("FREE")), SIZET2NUM(freed));
++
++    for (i = 0; i <= T_MASK; i++) {
++        VALUE type;
++        switch (i) {
++#define COUNT_TYPE(t) case t: type = ID2SYM(rb_intern(#t)); break;
++	    COUNT_TYPE(T_NONE);
++	    COUNT_TYPE(T_OBJECT);
++	    COUNT_TYPE(T_CLASS);
++	    COUNT_TYPE(T_MODULE);
++	    COUNT_TYPE(T_FLOAT);
++	    COUNT_TYPE(T_STRING);
++	    COUNT_TYPE(T_REGEXP);
++	    COUNT_TYPE(T_ARRAY);
++	    COUNT_TYPE(T_HASH);
++	    COUNT_TYPE(T_STRUCT);
++	    COUNT_TYPE(T_BIGNUM);
++	    COUNT_TYPE(T_FILE);
++	    COUNT_TYPE(T_DATA);
++	    COUNT_TYPE(T_MATCH);
++	    COUNT_TYPE(T_COMPLEX);
++	    COUNT_TYPE(T_RATIONAL);
++	    COUNT_TYPE(T_NIL);
++	    COUNT_TYPE(T_TRUE);
++	    COUNT_TYPE(T_FALSE);
++	    COUNT_TYPE(T_SYMBOL);
++	    COUNT_TYPE(T_FIXNUM);
++	    COUNT_TYPE(T_UNDEF);
++	    COUNT_TYPE(T_NODE);
++	    COUNT_TYPE(T_ICLASS);
++	    COUNT_TYPE(T_ZOMBIE);
++#undef COUNT_TYPE
++          default:              type = INT2NUM(i); break;
++        }
++        if (counts[i]) {
++            rb_hash_aset(hash, type, SIZET2NUM(counts2[i]/counts[i]));
++        }
++    }
+     return hash;
+ }
+ 
+@@ -2866,7 +2952,6 @@
+     return Qnil;
+ }
+ 
+-
+ /*
+  *  The <code>GC</code> module provides an interface to Ruby's mark and
+  *  sweep garbage collection mechanism. Some of the underlying methods
+@@ -2915,6 +3000,7 @@
+     rb_define_method(rb_mKernel, "object_id", rb_obj_id, 0);
+ 
+     rb_define_module_function(rb_mObSpace, "count_objects", count_objects, -1);
++    rb_define_module_function(rb_mObSpace, "count_object_lifetimes", count_object_lifetimes, -1);
+ 
+ #if CALC_EXACT_MALLOC_SIZE
+     rb_define_singleton_method(rb_mGC, "malloc_allocated_size", gc_malloc_allocated_size, 0);

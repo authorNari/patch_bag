@@ -1,0 +1,593 @@
+Index: intern.h
+===================================================================
+--- intern.h	(revision 19395)
++++ intern.h	(working copy)
+@@ -246,6 +246,7 @@
+ void rb_gc_mark_maybe _((VALUE));
+ void rb_gc_mark _((VALUE));
+ void rb_gc_force_recycle _((VALUE));
++void rb_gc_marke_check _((VALUE));
+ void rb_gc _((void));
+ void rb_gc_copy_finalizer _((VALUE,VALUE));
+ void rb_gc_finalize_deferred _((void));
+Index: ruby.h
+===================================================================
+--- ruby.h	(revision 19395)
++++ ruby.h	(working copy)
+@@ -205,6 +205,8 @@
+ #define T_STRUCT 0x0c
+ #define T_BIGNUM 0x0d
+ #define T_FILE   0x0e
++#define T_BITMAP 0x19
++#define T_ZOMBIE 0x1e
+ 
+ #define T_TRUE   0x20
+ #define T_FALSE  0x21
+@@ -297,9 +299,17 @@
+ #define CHR2FIX(x) INT2FIX((long)((x)&0xff))
+ 
+ VALUE rb_newobj _((void));
++#define FL_FORCE_SET(obj,t) do {\
++    if (RBASIC(obj)->flags & FL_ALIGNOFF) {\
++	RBASIC(obj)->flags = FL_ALIGNOFF | t;\
++    }\
++    else {\
++	RBASIC(obj)->flags = t;\
++    }\
++} while(0)
+ #define NEWOBJ(obj,type) type *obj = (type*)rb_newobj()
+ #define OBJSETUP(obj,c,t) do {\
+-    RBASIC(obj)->flags = (t);\
++    FL_FORCE_SET(obj, t);\
+     RBASIC(obj)->klass = (c);\
+     if (rb_safe_level() >= 3) FL_SET(obj, FL_TAINT);\
+ } while (0)
+@@ -441,7 +451,7 @@
+ #define RFILE(obj)   (R_CAST(RFile)(obj))
+ 
+ #define FL_SINGLETON FL_USER0
+-#define FL_MARK      (1<<6)
++#define FL_ALIGNOFF  (1<<6)
+ #define FL_FINALIZE  (1<<7)
+ #define FL_TAINT     (1<<8)
+ #define FL_EXIVAR    (1<<9)
+Index: eval.c
+===================================================================
+--- eval.c	(revision 19395)
++++ eval.c	(working copy)
+@@ -10155,7 +10155,7 @@
+         return;
+ 
+     FOREACH_THREAD_FROM(main_thread, th) {
+-	if (FL_TEST(th->thread, FL_MARK)) continue;
++	if (rb_gc_mark_check(th->thread)) continue;
+ 	if (th->status == THREAD_STOPPED) {
+ 	    th->status = THREAD_TO_KILL;
+ 	    rb_gc_mark(th->thread);
+Index: gc.c
+===================================================================
+--- gc.c	(revision 19395)
++++ gc.c	(working copy)
+@@ -270,6 +270,12 @@
+ 	    unsigned long flags;	/* always 0 for freed obj */
+ 	    struct RVALUE *next;
+ 	} free;
++	struct {
++	    VALUE flags;
++	    int *map;
++	    VALUE slot;
++	    int limit;
++	} bitmap;
+ 	struct RBasic  basic;
+ 	struct RObject object;
+ 	struct RClass  klass;
+@@ -300,11 +306,11 @@
+ static RVALUE *freelist = 0;
+ static RVALUE *deferred_final_list = 0;
+ 
+-#define HEAPS_INCREMENT 10
+ static struct heaps_slot {
+     void *membase;
+     RVALUE *slot;
+     int limit;
++    RVALUE *bitmap;
+ } *heaps;
+ static int heaps_length = 0;
+ static int heaps_used   = 0;
+@@ -312,77 +318,228 @@
+ #define HEAP_MIN_SLOTS 10000
+ static int heap_slots = HEAP_MIN_SLOTS;
+ 
++/* tiny heap size */
++#define BITMAP_ALIGN 0x4000
++
++static const int HEAP_SIZE = (BITMAP_ALIGN /sizeof(RVALUE) + 2) * sizeof(RVALUE);
++#define BITMAP_MASK  ~(0x3FFF)
++#define HEAP_OBJ_LIMIT (HEAP_SIZE / sizeof(struct RVALUE) - 1)
++
+ #define FREE_MIN  4096
+ 
+ static RVALUE *himem, *lomem;
+ 
+ static void
+-add_heap()
++allocate_heaps(size_t next_heaps_length)
+ {
+-    RVALUE *p, *pend;
++    struct heaps_slot *p;
++    size_t size;
+ 
+-    if (heaps_used == heaps_length) {
+-	/* Realloc heaps */
+-	struct heaps_slot *p;
+-	int length;
++    size = next_heaps_length*sizeof(struct heaps_slot);
++    RUBY_CRITICAL(
++		  if (heaps_used > 0) {
++		      p = (struct heaps_slot *)realloc(heaps, size);
++		      if (p) heaps = p;
++		  }
++		  else {
++		      p = heaps = (struct heaps_slot *)malloc(size);
++		  }
++		  );
++    if (p == 0) {
++	during_gc = 0;
++	rb_memerror();
++    }
++    heaps_length = next_heaps_length;
++}
+ 
+-	heaps_length += HEAPS_INCREMENT;
+-	length = heaps_length*sizeof(struct heaps_slot);
+-	RUBY_CRITICAL(
+-	    if (heaps_used > 0) {
+-		p = (struct heaps_slot *)realloc(heaps, length);
+-		if (p) heaps = p;
+-	    }
+-	    else {
+-		p = heaps = (struct heaps_slot *)malloc(length);
+-	    });
+-	if (p == 0) rb_memerror();
++#define FIND_BITMAP(res, p) do {\
++    if (((RVALUE *)p)->as.free.flags & FL_ALIGNOFF) {\
++        res = (RVALUE *)((((VALUE)p & BITMAP_MASK) + BITMAP_ALIGN) / sizeof(RVALUE) * sizeof(RVALUE)); \
++    }\
++    else {\
++        res = (RVALUE *)(((VALUE)p & BITMAP_MASK) / sizeof(RVALUE) * sizeof(RVALUE));\
++    }\
++} while(0)
++
++#define NUM_IN_SLOT(p, slot) (((VALUE)p - (VALUE)slot)/sizeof(RVALUE))
++#define BITMAP_INDEX(bmap, p) (NUM_IN_SLOT(p, bmap->as.bitmap.slot) / (sizeof(int) * 8))
++// #define BITMAP_INDEX(bmap, p) (NUM_IN_SLOT(p, bmap->as.bitmap.slot) >> 5)
++#define BITMAP_OFFSET(bmap, p) (NUM_IN_SLOT(p, bmap->as.bitmap.slot) & ((sizeof(int) * 8)-1))
++#define MARKED_IN_BITMAP(bmap, p) (bmap->as.bitmap.map[BITMAP_INDEX(bmap, p)] & 1 << BITMAP_OFFSET(bmap, p))
++#define MARK_IN_BITMAP(bmap, p) (bmap->as.bitmap.map[BITMAP_INDEX(bmap, p)] |= 1 << BITMAP_OFFSET(bmap, p))
++#define CLEAR_IN_BITMAP(bmap, p) (bmap->as.bitmap.map[BITMAP_INDEX(bmap, p)] &= ~(1 << BITMAP_OFFSET(bmap, p)))
++#define MARKED_IN_BITMAP_DIRECT(map, index, offset) (map[index] & 1 << offset)
++#define MARK_IN_BITMAP_DIRECT(map, index, offset) (map[index] |= 1 << offset)
++
++int
++rb_gc_mark_check(VALUE p)
++{
++    RVALUE *bmap;
++
++    FIND_BITMAP(bmap, (RVALUE *)p);
++    return MARKED_IN_BITMAP(bmap, (RVALUE *)p);
++}
++
++static void
++make_bitmap(struct heaps_slot *slot)
++{
++    RVALUE *p, *pend, *bitmap, *last, *border;
++    int *map = 0;
++    int size;
++   
++    p = slot->slot;
++    pend = p + slot->limit;
++    last = pend - 1;
++    RBASIC(last)->flags = 0;
++    FIND_BITMAP(bitmap, last);
++    if (bitmap < p || pend <= bitmap) {
++	rb_bug("not include in heap slot: result bitmap(%p), find (%p), p (%p), pend(%p)", bitmap, last, p, pend);
+     }
++    border = bitmap;
++    if (!((VALUE)border % BITMAP_ALIGN)) {
++	border--;
++    }
++    while (p < pend) {
++	if (p <= border) {
++	    RBASIC(p)->flags = FL_ALIGNOFF;
++	}
++	else {
++	    RBASIC(p)->flags = 0;
++	}
++	p++;
++    }
+ 
+-    for (;;) {
+-	RUBY_CRITICAL(p = (RVALUE*)malloc(sizeof(RVALUE)*(heap_slots+1)));
+-	if (p == 0) {
+-	    if (heap_slots == HEAP_MIN_SLOTS) {
+-		rb_memerror();
+-	    }
+-	    heap_slots = HEAP_MIN_SLOTS;
+-	    continue;
++    size = sizeof(int) * (HEAP_OBJ_LIMIT / (sizeof(int) * 8)+1);
++    map = (int *)malloc(size);
++    if (map == 0) {
++	rb_memerror();
++    }
++    MEMZERO(map, int, (size/sizeof(int)));
++    bitmap->as.bitmap.flags |= T_BITMAP;
++    bitmap->as.bitmap.map = map;
++    bitmap->as.bitmap.slot = (VALUE)slot->slot;
++    bitmap->as.bitmap.limit = slot->limit;
++    slot->bitmap = bitmap;
++}
++
++static void
++assign_heap_slot()
++{
++    RVALUE *p, *pend, *membase;
++    size_t hi, lo, mid;
++    int objs;
++	
++    objs = HEAP_OBJ_LIMIT;
++    RUBY_CRITICAL(p = (RVALUE*)malloc(HEAP_SIZE));
++    if (p == 0) {
++	during_gc = 0;
++	rb_memerror();
++    }
++
++    membase = p;
++    if ((VALUE)p % sizeof(RVALUE) != 0) {
++	p = (RVALUE*)((VALUE)p + sizeof(RVALUE) - ((VALUE)p % sizeof(RVALUE)));
++    }
++
++    lo = 0;
++    hi = heaps_used;
++    while (lo < hi) {
++	register RVALUE *mid_membase;
++	mid = (lo + hi) / 2;
++	mid_membase = heaps[mid].membase;
++	if (mid_membase < membase) {
++	    lo = mid + 1;
+ 	}
+-        heaps[heaps_used].membase = p;
+-        if ((VALUE)p % sizeof(RVALUE) == 0)
+-            heap_slots += 1;
+-        else
+-            p = (RVALUE*)((VALUE)p + sizeof(RVALUE) - ((VALUE)p % sizeof(RVALUE)));
+-        heaps[heaps_used].slot = p;
+-        heaps[heaps_used].limit = heap_slots;
+-	break;
++	else if (mid_membase > membase) {
++	    hi = mid;
++	}
++	else {
++	    rb_bug("same heap slot is allocated: %p at %d", membase, (VALUE)mid);
++	}
+     }
+-    pend = p + heap_slots;
++    if (hi < heaps_used) {
++	MEMMOVE(&heaps[hi+1], &heaps[hi], struct heaps_slot, heaps_used - hi);
++    }
++
++    heaps[hi].membase = membase;
++    heaps[hi].slot = p;
++    heaps[hi].limit = objs;
++    pend = p + objs;
+     if (lomem == 0 || lomem > p) lomem = p;
+     if (himem < pend) himem = pend;
+     heaps_used++;
+-    heap_slots *= 1.8;
+-    if (heap_slots <= 0) heap_slots = HEAP_MIN_SLOTS;
+ 
++    make_bitmap(&heaps[hi]);
+     while (p < pend) {
+-	p->as.free.flags = 0;
+-	p->as.free.next = freelist;
+-	freelist = p;
++	if (BUILTIN_TYPE(p) != T_BITMAP) {
++	    p->as.free.next = freelist;
++	    freelist = p;
++	}
+ 	p++;
+     }
+ }
++
++static int heaps_inc = 0;
++
++static void
++init_heap()
++{
++    size_t add, i;
++
++    add = HEAP_MIN_SLOTS / HEAP_OBJ_LIMIT;
++
++    if ((heaps_used + add) > heaps_length) {
++    	allocate_heaps(heaps_used + add);
++    }
++
++    for (i = 0; i < add; i++) {
++    	assign_heap_slot();
++    }
++    heaps_inc = 0;
++}
++
+ #define RANY(o) ((RVALUE*)(o))
+ 
++static void
++set_heaps_increment()
++{
++    size_t next_heaps_length = heaps_used * 1.8;
++    heaps_inc = next_heaps_length - heaps_used;
++
++    if (next_heaps_length > heaps_length) {
++	allocate_heaps(next_heaps_length);
++    }
++}
++
++static int
++heaps_increment()
++{
++    if (heaps_inc > 0) {
++	assign_heap_slot();
++	heaps_inc--;
++	return Qtrue;
++    }
++    return Qfalse;
++}
++
+ VALUE
+ rb_newobj()
+ {
+     VALUE obj;
++    int bmap_left = 0;
+ 
+-    if (!freelist) garbage_collect();
++    if (!freelist && !heaps_increment()) garbage_collect();
+ 
+     obj = (VALUE)freelist;
+     freelist = freelist->as.free.next;
++
++    if (RANY(obj)->as.free.flags & FL_ALIGNOFF) {
++	bmap_left = Qtrue;
++    }
+     MEMZERO((void*)obj, RVALUE, 1);
++    if (bmap_left) {
++	RANY(obj)->as.free.flags = FL_ALIGNOFF;
++    }
+ #ifdef GC_DEBUG
+     RANY(obj)->file = ruby_sourcefile;
+     RANY(obj)->line = ruby_sourceline;
+@@ -562,18 +719,21 @@
+ static void gc_mark _((VALUE ptr, int lev));
+ static void gc_mark_children _((VALUE ptr, int lev));
+ 
++#define IS_FREE_CELL(obj) ((obj->as.basic.flags & ~(FL_ALIGNOFF)) == 0)
++
+ static void
+ gc_mark_all()
+ {
+-    RVALUE *p, *pend;
++    RVALUE *p, *pend, *bmap;
+     int i;
+ 
+     init_mark_stack();
+     for (i = 0; i < heaps_used; i++) {
+ 	p = heaps[i].slot; pend = p + heaps[i].limit;
++	bmap = heaps[i].bitmap;
+ 	while (p < pend) {
+-	    if ((p->as.basic.flags & FL_MARK) &&
+-		(p->as.basic.flags != FL_MARK)) {
++	    if (MARKED_IN_BITMAP(bmap, p) &&
++		!(IS_FREE_CELL(p))) {
+ 		gc_mark_children((VALUE)p, 0);
+ 	    }
+ 	    p++;
+@@ -711,13 +871,15 @@
+     VALUE ptr;
+     int lev;
+ {
+-    register RVALUE *obj;
++    register RVALUE *obj, *bmap;
+ 
+     obj = RANY(ptr);
+     if (rb_special_const_p(ptr)) return; /* special const not marked */
+-    if (obj->as.basic.flags == 0) return;       /* free cell */
+-    if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+-    obj->as.basic.flags |= FL_MARK;
++    if (IS_FREE_CELL(obj)) return;       /* free cell */
++    if (BUILTIN_TYPE(obj) == T_BITMAP) return;
++    FIND_BITMAP(bmap, obj);
++    if (MARKED_IN_BITMAP(bmap, obj)) return;  /* already marked */
++    MARK_IN_BITMAP(bmap, obj);
+ 
+     if (lev > GC_LEVEL_MAX || (lev == 0 && ruby_stack_check())) {
+ 	if (!mark_stack_overflow) {
+@@ -746,16 +908,17 @@
+     VALUE ptr;
+     int lev;
+ {
+-    register RVALUE *obj = RANY(ptr);
++    register RVALUE *obj = RANY(ptr), *bmap;
+ 
+     goto marking;		/* skip */
+ 
+   again:
+     obj = RANY(ptr);
+     if (rb_special_const_p(ptr)) return; /* special const not marked */
+-    if (obj->as.basic.flags == 0) return;       /* free cell */
+-    if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+-    obj->as.basic.flags |= FL_MARK;
++    if (IS_FREE_CELL(obj)) return;       /* free cell */
++    FIND_BITMAP(bmap, obj);
++    if (MARKED_IN_BITMAP(bmap, obj)) return;  /* already marked */
++    MARK_IN_BITMAP(bmap, obj);
+ 
+   marking:
+     if (FL_TEST(obj, FL_EXIVAR)) {
+@@ -1007,7 +1170,7 @@
+ 	RVALUE *tmp = p->as.free.next;
+ 	run_final((VALUE)p);
+ 	if (!FL_TEST(p, FL_SINGLETON)) { /* not freeing page */
+-	    p->as.free.flags = 0;
++	    FL_FORCE_SET(p, 0);
+ 	    p->as.free.next = freelist;
+ 	    freelist = p;
+ 	}
+@@ -1023,6 +1186,7 @@
+     for (i = j = 1; j < heaps_used; i++) {
+ 	if (heaps[i].limit == 0) {
+ 	    free(heaps[i].membase);
++	    free(heaps[i].bitmap->as.bitmap.map);
+ 	    heaps_used--;
+ 	}
+ 	else {
+@@ -1057,10 +1221,17 @@
+            if yacc's semantic stack is not allocated on machine stack */
+ 	for (i = 0; i < heaps_used; i++) {
+ 	    p = heaps[i].slot; pend = p + heaps[i].limit;
++	    int *map = heaps[i].bitmap->as.bitmap.map;
++	    int deferred, bmap_index = 0, bmap_offset = 0;
+ 	    while (p < pend) {
+-		if (!(p->as.basic.flags&FL_MARK) && BUILTIN_TYPE(p) == T_NODE)
++		if (!(MARKED_IN_BITMAP_DIRECT(map, bmap_index, bmap_offset)) && BUILTIN_TYPE(p) == T_NODE)
+ 		    gc_mark((VALUE)p, 0);
+ 		p++;
++		bmap_offset++;
++		if (bmap_offset >= (sizeof(int) * 8)) {
++		    bmap_index++;
++		    bmap_offset = 0;
++		}
+ 	    }
+ 	}
+     }
+@@ -1077,35 +1248,47 @@
+ 	int n = 0;
+ 	RVALUE *free = freelist;
+ 	RVALUE *final = final_list;
++	int *map = heaps[i].bitmap->as.bitmap.map;
++	int deferred, bmap_index = 0, bmap_offset = 0;
+ 
+ 	p = heaps[i].slot; pend = p + heaps[i].limit;
+ 	while (p < pend) {
+-	    if (!(p->as.basic.flags & FL_MARK)) {
+-		if (p->as.basic.flags) {
++	    if (BUILTIN_TYPE(p) == T_BITMAP) {
++	    }
++	    else if (!(MARKED_IN_BITMAP_DIRECT(map, bmap_index, bmap_offset))) {
++		if (!(IS_FREE_CELL(p))) {
+ 		    obj_free((VALUE)p);
+ 		}
+ 		if (need_call_final && FL_TEST(p, FL_FINALIZE)) {
+-		    p->as.free.flags = FL_MARK; /* remain marked */
++		    FL_FORCE_SET(p, T_ZOMBIE);
+ 		    p->as.free.next = final_list;
+ 		    final_list = p;
+ 		}
+ 		else {
+-		    p->as.free.flags = 0;
+-		    p->as.free.next = freelist;
++		    if (!IS_FREE_CELL(p))
++			FL_FORCE_SET(p, 0);
++		    if (p->as.free.next != freelist) {
++			p->as.free.next = freelist;
++		    }
+ 		    freelist = p;
+ 		}
+ 		n++;
+ 	    }
+-	    else if (RBASIC(p)->flags == FL_MARK) {
++	    else if (BUILTIN_TYPE(p) == T_ZOMBIE) {
+ 		/* objects to be finalized */
+ 		/* do nothing remain marked */
+ 	    }
+ 	    else {
+-		RBASIC(p)->flags &= ~FL_MARK;
+ 		live++;
+ 	    }
+ 	    p++;
++	    bmap_offset++;
++	    if (bmap_offset >= (sizeof(int) * 8)) {
++		bmap_index++;
++		bmap_offset = 0;
++	    }
+ 	}
++	MEMZERO(heaps[i].bitmap->as.bitmap.map, int, bmap_index+1);
+ 	if (n == heaps[i].limit && freed > free_min) {
+ 	    RVALUE *pp;
+ 
+@@ -1125,7 +1308,8 @@
+     }
+     malloc_increase = 0;
+     if (freed < free_min) {
+-	add_heap();
++    	set_heaps_increment();
++	heaps_increment();
+     }
+     during_gc = 0;
+ 
+@@ -1141,7 +1325,11 @@
+ rb_gc_force_recycle(p)
+     VALUE p;
+ {
+-    RANY(p)->as.free.flags = 0;
++    RVALUE *bmap;
++
++    FL_FORCE_SET(p, 0);
++    FIND_BITMAP(bmap, p);
++    CLEAR_IN_BITMAP(bmap, p);
+     RANY(p)->as.free.next = freelist;
+     freelist = RANY(p);
+ }
+@@ -1332,7 +1520,10 @@
+ #endif
+     if (dont_gc || during_gc) {
+ 	if (!freelist) {
+-	    add_heap();
++            if (!heaps_increment()) {
++                set_heaps_increment();
++                heaps_increment();
++            }
+ 	}
+ 	return;
+     }
+@@ -1595,7 +1786,7 @@
+     if (!rb_gc_stack_start) {
+ 	Init_stack(0);
+     }
+-    add_heap();
++    init_heap();
+ }
+ 
+ static VALUE
+@@ -1647,6 +1838,7 @@
+ 		  case T_ICLASS:
+ 		  case T_VARMAP:
+ 		  case T_SCOPE:
++		  case T_ZOMBIE:
+ 		  case T_NODE:
+ 		    continue;
+ 		  case T_CLASS:
+@@ -1920,7 +2112,7 @@
+ 	while (p < pend) {
+ 	    if (BUILTIN_TYPE(p) == T_DATA &&
+ 		DATA_PTR(p) && RANY(p)->as.data.dfree) {
+-		p->as.free.flags = 0;
++		FL_FORCE_SET(p, 0);
+ 		if ((long)RANY(p)->as.data.dfree == -1) {
+ 		    RUBY_CRITICAL(free(DATA_PTR(p)));
+ 		}
+@@ -1929,7 +2121,7 @@
+ 		}
+ 	    }
+ 	    else if (BUILTIN_TYPE(p) == T_FILE) {
+-		p->as.free.flags = 0;
++		FL_FORCE_SET(p, 0);
+ 		rb_io_fptr_finalize(RANY(p)->as.file.fptr);
+ 	    }
+ 	    p++;

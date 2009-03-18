@@ -1,0 +1,228 @@
+Index: gc.c
+===================================================================
+--- gc.c	(リビジョン 18055)
++++ gc.c	(作業コピー)
+@@ -92,6 +92,103 @@
+ 
+ #undef GC_DEBUG
+ 
++/* for GC profile */
++#define GC_PROFILE 0
++#if GC_PROFILE
++
++typedef struct gc_profile_data {
++    double gc_time;
++    double gc_mark_time;
++    double gc_sweep_time;
++    size_t heaps_use_count;
++    size_t heaps_live;
++    size_t heaps_free;
++    size_t heaps_all_objects;
++    int is_exist_finalize;
++    size_t allocate_increase;
++    size_t allocate_limit;
++} gc_profile_data;
++
++/* referenced document http://kzk9.net/column/time.html */
++static double
++getrusage_time(void)
++{
++    struct rusage usage;
++    struct timeval time;
++    getrusage(RUSAGE_SELF, &usage);
++    time = usage.ru_utime;
++    return time.tv_sec + (double)time.tv_usec*1e-6;
++}
++
++#define INIT_GC_PROF_PARAMS double gc_time = 0, mark_time = 0, sweep_time = 0;\
++    size_t count = objspace->count
++
++#define GC_PROF_TIMER_START do {\
++    if (!objspace->gc_profile) {\
++        objspace->gc_profile_size = 1000;\
++	objspace->gc_profile = malloc(sizeof(gc_profile_data) * objspace->gc_profile_size);\
++    }\
++    if (count >= objspace->gc_profile_size) {\
++        objspace->gc_profile_size += 1000;\
++	objspace->gc_profile = realloc(objspace->gc_profile, sizeof(gc_profile_data) * objspace->gc_profile_size);\
++    }\
++    if (!objspace->gc_profile) {\
++	rb_bug("gc_profile malloc or realloc miss");\
++    }\
++    MEMZERO(&objspace->gc_profile[count], gc_profile_data, 1);\
++    gc_time = getrusage_time();\
++} while(0)
++
++#define GC_PROF_TIMER_STOP do {\
++    gc_time = getrusage_time() - gc_time;\
++    objspace->gc_profile[count].gc_time = gc_time;\
++} while(0)
++
++#define GC_PROF_MARK_TIMER_START do {\
++    mark_time = getrusage_time();\
++} while(0)
++
++#define GC_PROF_MARK_TIMER_STOP do {\
++    mark_time = getrusage_time() - mark_time;\
++    objspace->gc_profile[count].gc_mark_time = mark_time;\
++} while(0)
++
++#define GC_PROF_SWEEP_TIMER_START do {\
++    sweep_time = getrusage_time();\
++} while(0)
++
++#define GC_PROF_SWEEP_TIMER_STOP do {\
++    sweep_time = getrusage_time() - sweep_time;\
++    objspace->gc_profile[count].gc_sweep_time = sweep_time;\
++} while(0)
++
++#define GC_PROF_SET_MALLOC_INFO do {\
++    size_t count = objspace->count - 1;\
++    objspace->gc_profile[count].allocate_increase = malloc_increase;\
++    objspace->gc_profile[count].allocate_limit = malloc_limit;\
++} while(0)
++
++#define GC_PROF_SET_HEAP_INFO do {\
++    size_t count = objspace->count - 1;\
++    objspace->gc_profile[count].heaps_use_count = heaps_used;\
++    objspace->gc_profile[count].heaps_live = live;\
++    objspace->gc_profile[count].heaps_free = freed;\
++    objspace->gc_profile[count].heaps_all_objects = heaps_used * HEAP_OBJ_LIMIT;\
++    objspace->gc_profile[count].is_exist_finalize = final_list ? Qtrue : Qfalse; \
++} while(0)
++
++#else
++#define INIT_GC_PROF_PARAMS
++#define GC_PROF_TIMER_START
++#define GC_PROF_TIMER_STOP
++#define GC_PROF_MARK_TIMER_START
++#define GC_PROF_MARK_TIMER_STOP
++#define GC_PROF_SWEEP_TIMER_START
++#define GC_PROF_SWEEP_TIMER_STOP
++#define GC_PROF_SET_MALLOC_INFO
++#define GC_PROF_SET_HEAP_INFO
++#endif
++
+ #if defined(_MSC_VER) || defined(__BORLANDC__) || defined(__CYGWIN__)
+ #pragma pack(push, 1) /* magic for reducing sizeof(RVALUE): 24 -> 20 */
+ #endif
+@@ -179,6 +276,10 @@
+     struct gc_list *global_list;
+     unsigned int count;
+     int gc_stress;
++#if GC_PROFILE
++    gc_profile_data *gc_profile;
++    size_t gc_profile_size;
++#endif
+ } rb_objspace_t;
+ 
+ #if defined(ENABLE_VM_OBJSPACE) && ENABLE_VM_OBJSPACE
+@@ -1440,6 +1541,7 @@
+ 	    freed += n;
+ 	}
+     }
++    GC_PROF_SET_MALLOC_INFO;
+     if (malloc_increase > malloc_limit) {
+ 	malloc_limit += (malloc_increase - malloc_limit) * (double)live / (live + freed);
+ 	if (malloc_limit < GC_MALLOC_LIMIT) malloc_limit = GC_MALLOC_LIMIT;
+@@ -1453,10 +1555,12 @@
+ 
+     /* clear finalization list */
+     if (final_list) {
++	GC_PROF_SET_HEAP_INFO;
+ 	deferred_final_list = final_list;
+ 	return;
+     }
+     free_unused_heaps(objspace);
++    GC_PROF_SET_HEAP_INFO;
+ }
+ 
+ void
+@@ -1672,6 +1776,7 @@
+ {
+     struct gc_list *list;
+     rb_thread_t *th = GET_THREAD();
++    INIT_GC_PROF_PARAMS;
+ 
+     if (GC_NOTIFY) printf("start garbage_collect()\n");
+ 
+@@ -1691,6 +1796,8 @@
+     during_gc++;
+     objspace->count++;
+ 
++    GC_PROF_TIMER_START;
++    GC_PROF_MARK_TIMER_START;
+     SET_STACK_END;
+ 
+     init_mark_stack(objspace);
+@@ -1731,9 +1838,13 @@
+ 	    gc_mark_rest(objspace);
+ 	}
+     }
++    GC_PROF_MARK_TIMER_STOP;
+ 
++    GC_PROF_SWEEP_TIMER_START;
+     gc_sweep(objspace);
++    GC_PROF_SWEEP_TIMER_STOP;
+ 
++    GC_PROF_TIMER_STOP;
+     if (GC_NOTIFY) printf("end garbage_collect()\n");
+     return Qtrue;
+ }
+@@ -2386,7 +2497,48 @@
+ }
+ #endif
+ 
++#if GC_PROFILE
++
+ /*
++ *  call-seq:
++ *     GC.profile_report -> hash
++ *
++ *  Report profile data.
++ *
++ *  It returns a hash as:
++ *  {:gc_count => 20 :report => [{:gc_time => 0.001, :gc_mark_time => 0.00004, :gc_sweep_time => 0.00006 }, ... }]}
++ */
++
++VALUE
++gc_profile_report(void)
++{
++    VALUE prof = 0;
++    VALUE res = rb_hash_new();
++    VALUE datas = rb_ary_new();
++    size_t i;
++    rb_objspace_t *objspace = (&rb_objspace);
++    
++    for (i =0; i < objspace->count; i++) {
++	prof = rb_hash_new();
++        rb_hash_aset(prof, ID2SYM(rb_intern("gc_time")), DOUBLE2NUM(objspace->profile.data[i].gc_time));
++        rb_hash_aset(prof, ID2SYM(rb_intern("gc_mark_time")), DOUBLE2NUM(objspace->profile.data[i].gc_mark_time));
++	rb_hash_aset(prof, ID2SYM(rb_intern("gc_sweep_time")), DOUBLE2NUM(objspace->profile.data[i].gc_sweep_time));
++        rb_hash_aset(prof, ID2SYM(rb_intern("allocate_increase")), rb_uint2inum(objspace->profile.data[i].allocate_increase));
++        rb_hash_aset(prof, ID2SYM(rb_intern("allocate_limit")), rb_uint2inum(objspace->profile.data[i].allocate_limit));
++        rb_hash_aset(prof, ID2SYM(rb_intern("heaps_use_count")), rb_uint2inum(objspace->profile.data[i].heaps_use_count));
++        rb_hash_aset(prof, ID2SYM(rb_intern("heaps_live")), rb_uint2inum(objspace->profile.data[i].heaps_live));
++        rb_hash_aset(prof, ID2SYM(rb_intern("heaps_free")), rb_uint2inum(objspace->profile.data[i].heaps_free));
++        rb_hash_aset(prof, ID2SYM(rb_intern("heaps_all_objects")), rb_uint2inum(objspace->profile.data[i].heaps_all_objects));
++        rb_hash_aset(prof, ID2SYM(rb_intern("is_exist_finalize")), objspace->profile.data[i].is_exist_finalize);
++	rb_ary_push(datas, prof);
++    }
++    rb_hash_aset(res, ID2SYM(rb_intern("gc_count")), rb_uint2inum(objspace->count));
++    rb_hash_aset(res, ID2SYM(rb_intern("report")), datas);
++    return res;
++}
++#endif
++
++/*
+  *  The <code>GC</code> module provides an interface to Ruby's mark and
+  *  sweep garbage collection mechanism. Some of the underlying methods
+  *  are also available via the <code>ObjectSpace</code> module.
+@@ -2430,4 +2582,7 @@
+     rb_define_singleton_method(rb_mGC, "malloc_allocated_size", gc_malloc_allocated_size, 0);
+     rb_define_singleton_method(rb_mGC, "malloc_allocations", gc_malloc_allocations, 0);
+ #endif
++#if GC_PROFILE
++    rb_define_singleton_method(rb_mGC, "profile_report", gc_profile_report, 0);
++#endif
+ }

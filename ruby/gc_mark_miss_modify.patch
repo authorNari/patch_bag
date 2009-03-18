@@ -1,0 +1,12 @@
+diff -ur ruby-oci8-1.0.0-rc3/ext/oci8/stmt.c ruby-oci8-1.0.0-rc3-work/ext/oci8/stmt.c
+--- ruby-oci8-1.0.0-rc3/ext/oci8/stmt.c	2008-06-19 13:26:23.000000000 +0900
++++ ruby-oci8-1.0.0-rc3-work/ext/oci8/stmt.c	2008-06-19 13:26:22.000000000 +0900
+@@ -119,6 +119,8 @@
+   bh = (oci8_bind_handle_t *)oci8_make_handle(type, NULL, NULL, stmth, value_sz);
+   bh->bind_type = bind_type;
+   if (bind_type == BIND_HANDLE) {
++    bh->value.handle.v = Qnil;
++    bh->value.handle.klass = Qnil;
+     if (NIL_P(vlength)) {
+       oci8_handle_t *envh;
+       for (envh = stmth; envh->type != OCI_HTYPE_ENV; envh = envh->parent);

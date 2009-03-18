@@ -1,0 +1,134 @@
+Index: gc.c
+===================================================================
+--- gc.c	(リビジョン 17622)
++++ gc.c	(作業コピー)
+@@ -129,6 +129,17 @@
+ #pragma pack(pop)
+ #endif
+ 
++double cputime()
++{
++  struct timeval tv;
++  gettimeofday(&tv, NULL);
++  return tv.tv_sec + (double)tv.tv_usec*1e-6;
++}
++
++#define GC_PROF
++#define GC_MARK_PROF
++#define GC_SWEEP_PROF
++
+ struct heaps_slot {
+     void *membase;
+     RVALUE *slot;
+@@ -159,6 +170,7 @@
+ 	struct heaps_slot *ptr;
+ 	size_t length;
+ 	size_t used;
++	size_t live;
+ 	RVALUE *freelist;
+ 	RVALUE *range[2];
+ 	RVALUE *freed;
+@@ -201,6 +213,7 @@
+ #define himem			objspace->heap.range[1]
+ #define heaps_inc		objspace->heap.increment
+ #define heaps_freed		objspace->heap.freed
++#define _live			objspace->heap.live
+ #define dont_gc 		objspace->flags.dont_gc
+ #define during_gc		objspace->flags.during_gc
+ #define need_call_final 	objspace->final.need_call
+@@ -1027,6 +1040,7 @@
+     if (obj->as.basic.flags == 0) return;       /* free cell */
+     if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+     obj->as.basic.flags |= FL_MARK;
++    _live++;
+ 
+     if (lev > GC_LEVEL_MAX || (lev == 0 && ruby_stack_check())) {
+ 	if (!mark_stack_overflow) {
+@@ -1062,6 +1076,7 @@
+     if (obj->as.basic.flags == 0) return;       /* free cell */
+     if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+     obj->as.basic.flags |= FL_MARK;
++    _live++;
+ 
+   marking:
+     if (FL_TEST(obj, FL_EXIVAR)) {
+@@ -1661,6 +1676,12 @@
+ {
+     struct gc_list *list;
+     rb_thread_t *th = GET_THREAD();
++#ifdef GC_PROF
++    _live = 0;
++    double gc_time = 0, mark_time = 0, sweep_time = 0;
++    printf("gc_start!\n");
++    gc_time = cputime();
++#endif
+ 
+     if (GC_NOTIFY) printf("start garbage_collect()\n");
+ 
+@@ -1684,8 +1705,19 @@
+ 
+     init_mark_stack(objspace);
+ 
++#ifdef GC_MARK_PROF
++	printf("mark_start!\n");
++	mark_time = cputime();
++#endif
++
+     th->vm->self ? rb_gc_mark(th->vm->self) : rb_vm_mark(th->vm);
+ 
++#ifdef GC_PROF
++  double part_time = 0;
++  part_time = cputime();
++  printf("live : %d\n", _live);
++#endif
++
+     if (finalizer_table) {
+ 	mark_tbl(objspace, finalizer_table, 0);
+     }
+@@ -1695,7 +1727,12 @@
+     rb_gc_mark_threads();
+     rb_gc_mark_symbols();
+     rb_gc_mark_encodings();
++#ifdef GC_PROF
++    part_time = cputime() - part_time;
++    printf("part_time : %10.30f\n", part_time);
++#endif
+ 
++
+     /* mark protected global variables */
+     for (list = global_List; list; list = list->next) {
+ 	rb_gc_mark_maybe(*list->varptr);
+@@ -1721,8 +1758,33 @@
+ 	}
+     }
+ 
++
++#ifdef GC_MARK_PROF
++	mark_time = cputime() - mark_time;
++	printf("mark_time : %10.30f\n", mark_time);
++	printf("mark_end!\n");
++#endif
++
++#ifdef GC_SWEEP_PROF
++    printf("sweep_start!\n");
++    sweep_time = cputime();
++#endif
++
+     gc_sweep(objspace);
+ 
++#ifdef GC_SWEEP_PROF
++  sweep_time = cputime() - sweep_time;
++  printf("sweep_time : %10.30f\n", sweep_time);
++  printf("sweep_end!\n");
++#endif
++
++#ifdef GC_PROF
++    gc_time = cputime() - gc_time;
++    printf("gc_end!\n");
++    printf("gc_time : %10.30f\n", gc_time);
++    printf("heaps_used : %d\n", heaps_used);
++#endif
++
+     if (GC_NOTIFY) printf("end garbage_collect()\n");
+     return Qtrue;
+ }

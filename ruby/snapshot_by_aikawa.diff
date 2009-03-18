@@ -1,0 +1,535 @@
+Index: array.c
+===================================================================
+--- array.c	(リビジョン 20163)
++++ array.c	(作業コピー)
+@@ -332,7 +332,7 @@
+ 
+     va_start(ar, n);
+     for (i=0; i<n; i++) {
+-	RARRAY_PTR(ary)[i] = va_arg(ar, VALUE);
++	WRITE_BARRIER(RARRAY_PTR(ary)[i], va_arg(ar, VALUE)); //    RARRAY_PTR(ary)[i] = va_arg(ar, VALUE);
+     }
+     va_end(ar);
+ 
+@@ -599,7 +599,7 @@
+     if (idx >= RARRAY_LEN(ary)) {
+ 	ARY_SET_LEN(ary, idx + 1);
+     }
+-    RARRAY_PTR(ary)[idx] = val;
++    WRITE_BARRIER(RARRAY_PTR(ary)[idx], val); //RARRAY_PTR(ary)[idx] = val;
+ }
+ 
+ static VALUE
+@@ -1804,7 +1804,7 @@
+             FL_SET(tmp, FL_FREEZE);
+ 	}
+         /* tmp will be GC'ed. */
+-        RBASIC(tmp)->klass = rb_cArray;
++        WRITE_BARRIER(RBASIC(tmp)->klass, rb_cArray);     //RBASIC(tmp)->klass = rb_cArray;
+     }
+     return ary;
+ }
+Index: include/ruby/ruby.h
+===================================================================
+--- include/ruby/ruby.h	(リビジョン 20163)
++++ include/ruby/ruby.h	(作業コピー)
+@@ -502,7 +502,9 @@
+ #define NEWOBJ(obj,type) type *obj = (type*)rb_newobj()
+ #define OBJSETUP(obj,c,t) do {\
+     RBASIC(obj)->flags = (t);\
+-    RBASIC(obj)->klass = (c);\
++/*    if(is_marking)  rb_gc_mark(obj);    */\
++    if(is_marking)  ((struct RBasic *)obj)->flags |= FL_MARK;   \
++    RBASIC(obj)->klass = (c);   \
+     if (rb_safe_level() >= 3) FL_SET(obj, FL_TAINT | FL_UNTRUSTED);\
+ } while (0)
+ #define CLONESETUP(clone,obj) do {\
+@@ -1171,6 +1173,16 @@
+ 		       VALUE data);
+ int rb_remove_event_hook(rb_event_hook_func_t func);
+ 
++extern int is_marking;
++
++void barrier(void *ptr);
++
++#define WRITE_BARRIER(ptr, val) do {    \
++    barrier((void *)ptr);   \
++    (ptr) = (val);      \
++}while(0)
++
++
+ /* locale insensitive functions */
+ 
+ #define rb_isascii(c) ((unsigned long)(c) < 128)
+Index: gc.c
+===================================================================
+--- gc.c	(リビジョン 20163)
++++ gc.c	(作業コピー)
+@@ -80,8 +80,34 @@
+ 
+ #define nomem_error GET_VM()->special_exceptions[ruby_error_nomemory]
+ 
+-#define MARK_STACK_MAX 1024
++#define MARK_STACK_MAX 10240000
++/**  hikari ***********************/
++#if 1
++#define MARK_LIMIT  10
++#else
++#define MARK_LIMIT  INT_MAX
++#endif
+ 
++int is_marking = 0;
++#if 1
++static int all_block = 0;
++static int used_block = 0;
++#endif
++
++//#undef MYPROF
++#define MY_PROF 0
++#ifdef MY_PROF
++static int full_gc_count = 0;
++static double mark_time = 0.0f;
++static double sweep_time = 0.0f;
++static int mark_count = 0;
++static int mark_rest_count = 0;
++static int sweep_count = 0;
++#endif
++
++//static FILE *fp;
++/********** hikari ***************/
++
+ int ruby_gc_debug_indent = 0;
+ 
+ #undef GC_DEBUG
+@@ -404,6 +430,17 @@
+ static void run_final(rb_objspace_t *objspace, VALUE obj);
+ static int garbage_collect(rb_objspace_t *objspace);
+ 
++static int garbage_collect(rb_objspace_t *objspace);
++
++static int
++gc_mark_rest(rb_objspace_t *objspace, int limit);
++
++static void
++gc_sweep(rb_objspace_t *objspace);
++
++static void
++init_mark_stack(rb_objspace_t *objspace);
++
+ void
+ rb_global_variable(VALUE *var)
+ {
+@@ -543,11 +580,12 @@
+ #if CALC_EXACT_MALLOC_SIZE
+     size += sizeof(size_t);
+ #endif
+-
++#if 0
+     if ((ruby_gc_stress && !ruby_disable_gc_stress) ||
+ 	(malloc_increase+size) > malloc_limit) {
+ 	garbage_collect(objspace);
+     }
++#endif
+     mem = malloc(size);
+     if (!mem) {
+ 	if (garbage_collect(objspace)) {
+@@ -806,6 +844,8 @@
+ 	}
+     }
+ 
++    all_block += objs;
++
+     lo = 0;
+     hi = heaps_used;
+     while (lo < hi) {
+@@ -857,6 +897,7 @@
+     }
+     heaps_inc = 0;
+     objspace->profile.invoke_time = getrusage_time();
++    init_mark_stack(objspace);
+ }
+ 
+ 
+@@ -888,14 +929,66 @@
+ rb_newobj_from_heap(rb_objspace_t *objspace)
+ {
+     VALUE obj;
+-	
++
++#if 0	
+     if ((ruby_gc_stress && !ruby_disable_gc_stress) || !freelist) {
+     	if (!heaps_increment(objspace) && !garbage_collect(objspace)) {
+ 	    during_gc = 0;
+ 	    rb_memerror();
+ 	}
+     }
++#else
+ 
++#if 0
++    int free_block = 0, total_block = 0;
++    int i;
++    RVALUE *p = freelist;
++    for(i = 0; i < heaps_used; i++){
++        total_block += heaps[i].limit;
++    }
++    while(p){
++        free_block++;
++        p = p->as.free.next;
++    }
++#if 1
++    if(total_block != all_block || free_block != all_block - used_block){
++        printf("total: %d, all_block: %d\nfree: %d, unused: %d\n"
++            ,total_block, all_block, free_block, all_block - used_block);
++         rb_memerror();
++    }
++#endif
++
++#endif
++
++    if(all_block - used_block < (all_block / 2)){
++
++        garbage_collect(objspace);
++        if(!freelist){
++#if 0
++            rb_memerror();
++#else
++            if(is_marking){
++#ifdef MY_PROF
++                full_gc_count++;
++#endif
++                gc_mark_rest(objspace, INT_MAX);
++                is_marking = 0;
++                gc_sweep(objspace);
++            } else {
++                printf("memory exhausted2\n");
++                rb_memerror();
++            }
++            if(!freelist){
++                printf("memory exhausted4\n");
++                rb_memerror();
++            }
++#endif
++        }
++    }
++#endif
++
++
++
+     obj = (VALUE)freelist;
+     freelist = freelist->as.free.next;
+ 
+@@ -905,6 +998,28 @@
+     RANY(obj)->line = rb_sourceline();
+ #endif
+ 
++#if 1
++    if(is_marking) {
++        if (!mark_stack_overflow) {
++            RANY(obj)->as.basic.flags |= FL_MARK;
++#if 1
++            if (mark_stack_ptr - mark_stack < MARK_STACK_MAX) {     /* push to mark stack */
++                *mark_stack_ptr = obj;
++                mark_stack_ptr++;
++            } else {
++                mark_stack_overflow = 1;
++            }
++        } else {
++            printf("stack overflow!!\n");
++            rb_memerror();
++#endif
++        }
++    }
++#endif
++
++#if 1
++    used_block++;
++#endif
+     return obj;
+ }
+ 
+@@ -1094,9 +1209,23 @@
+     }
+ }
+ 
+-static void
+-gc_mark_rest(rb_objspace_t *objspace)
++//static void
++//gc_mark_rest(rb_objspace_t *objspace)
++static int
++gc_mark_rest(rb_objspace_t *objspace, int limit)
+ {
++    //VALUE *diff = mark_stack_ptr;
++
++#if 0
++    if (fp == NULL) {
++    if ((fp = fopen("stack.txt", "a")) == NULL) {
++        printf("file open error!! \n");
++        exit(EXIT_FAILURE);
++    }
++    }
++#endif
++
++#if 0
+     VALUE tmp_arry[MARK_STACK_MAX];
+     VALUE *p;
+ 
+@@ -1108,6 +1237,18 @@
+ 	p--;
+ 	gc_mark_children(objspace, *p, 0);
+     }
++#else
++    while (mark_stack_ptr != mark_stack) {
++        mark_stack_ptr--;
++        if (RANY(*mark_stack_ptr)->as.basic.flags == 0) continue;       /* free cell */
++        gc_mark_children(objspace, *mark_stack_ptr, 0);
++        if(--limit <= 0) break;
++    }
++#ifdef MY_PROF
++    mark_rest_count++;
++#endif
++    return limit;
++#endif
+ }
+ 
+ static inline int
+@@ -1138,6 +1279,18 @@
+     return Qfalse;
+ }
+ 
++extern void
++barrier(void *ptr){
++#if 0
++    if(is_pointer_to_heap(&rb_objspace, ptr) && is_marking){
++    if(is_pointer_to_heap(&rb_objspace, ptr)  && is_marking){
++    if(is_marking && !rb_special_const_p(ptr)){
++    if(is_marking && is_pointer_to_heap(&rb_objspace, ptr)){    
++        rb_gc_mark((VALUE)(ptr));
++    }
++#endif
++}
++
+ static void
+ mark_locations_array(rb_objspace_t *objspace, register VALUE *x, register long n)
+ {
+@@ -1256,7 +1409,7 @@
+     }
+ }
+ 
+-#define GC_LEVEL_MAX 250
++//#define GC_LEVEL_MAX 250
+ 
+ static void
+ gc_mark(rb_objspace_t *objspace, VALUE ptr, int lev)
+@@ -1268,8 +1421,11 @@
+     if (obj->as.basic.flags == 0) return;       /* free cell */
+     if (obj->as.basic.flags & FL_MARK) return;  /* already marked */
+     obj->as.basic.flags |= FL_MARK;
++#ifdef MY_PROF
++    mark_count++;
++#endif
+ 
+-    if (lev > GC_LEVEL_MAX || (lev == 0 && ruby_stack_check())) {
++//    if (lev > GC_LEVEL_MAX || (lev == 0 && ruby_stack_check())) {
+ 	if (!mark_stack_overflow) {
+ 	    if (mark_stack_ptr - mark_stack < MARK_STACK_MAX) {
+ 		*mark_stack_ptr = ptr;
+@@ -1278,10 +1434,15 @@
+ 	    else {
+ 		mark_stack_overflow = 1;
+ 	    }
++    } else {
++        printf("stack overflow!!\n");
++        rb_memerror();
+ 	}
++#if 0
+ 	return;
+     }
+     gc_mark_children(objspace, ptr, lev+1);
++#endif
+ }
+ 
+ void
+@@ -1567,6 +1728,8 @@
+     p->as.free.flags = 0;
+     p->as.free.next = freelist;
+     freelist = p;
++
++    used_block--;
+ }
+ 
+ static void
+@@ -1672,6 +1835,7 @@
+ 	    else {
+ 		RBASIC(p)->flags &= ~FL_MARK;
+ 		live++;
++        used_block++;
+ 	    }
+ 	    p++;
+ 	}
+@@ -1683,6 +1847,7 @@
+ 		pp->as.free.flags |= FL_SINGLETON; /* freeing page mark */
+ 	    }
+ 	    heaps[i].limit = final_num;
++        all_block -= heaps[i].limit;
+ 
+ 	    freelist = free;	/* cancel this page from freelist */
+ 	}
+@@ -1712,6 +1877,26 @@
+ 	free_unused_heaps(objspace);
+ 	GC_PROF_SET_HEAP_INFO;
+     }
++
++#if 1
++//double start = getrusage_time();
++    all_block = 0;
++    int tmp_free;
++    for(tmp_free = 0; tmp_free < heaps_used; tmp_free++){
++        all_block += heaps[tmp_free].limit;
++    }
++    p = freelist;
++    tmp_free = 0;
++    while(p){
++        tmp_free++;
++        p = p->as.free.next;
++    }
++    used_block = all_block - tmp_free;
++//double end = getrusage_time();
++#endif
++#ifdef MY_PROF
++    sweep_count++;
++#endif
+ }
+ 
+ void
+@@ -1909,14 +2094,14 @@
+ {
+     struct gc_list *list;
+     rb_thread_t *th = GET_THREAD();
+-    INIT_GC_PROF_PARAMS;
++    //INIT_GC_PROF_PARAMS;
+ 
+     if (GC_NOTIFY) printf("start garbage_collect()\n");
+ 
+     if (!heaps) {
+ 	return Qfalse;
+     }
+-
++#if 0
+     if (dont_gc || during_gc) {
+ 	if (!freelist) {
+             if (!heaps_increment(objspace)) {
+@@ -1926,14 +2111,20 @@
+ 	}
+ 	return Qtrue;
+     }
+-    during_gc++;
++    //during_gc++;
++#endif
++if(!is_marking){
++#if 0
+     objspace->count++;
+ 
+     GC_PROF_TIMER_START;
+-    GC_PROF_MARK_TIMER_START;
++#endif
++
++/* root scan */
++    //GC_PROF_MARK_TIMER_START;
+     SET_STACK_END;
+ 
+-    init_mark_stack(objspace);
++    //init_mark_stack(objspace);
+ 
+     th->vm->self ? rb_gc_mark(th->vm->self) : rb_vm_mark(th->vm);
+ 
+@@ -1961,7 +2152,13 @@
+ 
+     rb_gc_mark_parser();
+ 
++is_marking = 1;
++return Qtrue;
++}
++
++/* mark phase */
+     /* gc_mark objects whose marking are not completed*/
++#if 0
+     while (!MARK_STACK_EMPTY) {
+ 	if (mark_stack_overflow) {
+ 	    gc_mark_all(objspace);
+@@ -1970,13 +2167,37 @@
+ 	    gc_mark_rest(objspace);
+ 	}
+     }
+-    GC_PROF_MARK_TIMER_STOP;
++#endif
+ 
+-    GC_PROF_SWEEP_TIMER_START;
++    objspace->count++;
++    int limit = MARK_LIMIT;
++#ifdef MY_PROF
++double start = getrusage_time();
++#endif
++    limit = gc_mark_rest(objspace, limit);
++#ifdef MY_PROF
++double end = getrusage_time();
++    mark_time += (end - start);
++#endif
++
++
++    //GC_PROF_MARK_TIMER_STOP;
++    if(limit <= 0)  return Qtrue;   //mark phase continued
++
++is_marking = 0;
++
++#ifdef MY_PROF
++start = getrusage_time();
++#endif
++    //GC_PROF_SWEEP_TIMER_START;
+     gc_sweep(objspace);
+-    GC_PROF_SWEEP_TIMER_STOP;
++#ifdef MY_PROF
++end = getrusage_time();
++    sweep_time += (end - start);
++#endif
+ 
+-    GC_PROF_TIMER_STOP;
++    //GC_PROF_SWEEP_TIMER_STOP;
++    //GC_PROF_TIMER_STOP;
+     if (GC_NOTIFY) printf("end garbage_collect()\n");
+     return Qtrue;
+ }
+@@ -2759,7 +2980,24 @@
+  *  
+  */
+ 
++#ifdef MY_PROF
+ static VALUE
++gc_show_my_prof(int argc, VALUE *argv, VALUE self)
++{
++    printf("full: %d\nmark count: %d\nMARK_LIMIT: %d\nmark_time: %0.10f\nsweep_time: %0.10f\nmark_rest_count: %d\nsweep_count: %d\n\n"
++            ,full_gc_count
++            , mark_count
++            , MARK_LIMIT
++            , mark_time
++            , sweep_time
++            , mark_rest_count
++            , sweep_count);
++
++    return Qnil;
++}
++#endif
++
++static VALUE
+ gc_profile_report(int argc, VALUE *argv, VALUE self)
+ {
+     VALUE out;
+@@ -2804,6 +3042,9 @@
+     rb_define_singleton_method(rb_mProfiler, "clear", gc_profile_clear, 0);
+     rb_define_singleton_method(rb_mProfiler, "result", gc_profile_result, 0);
+     rb_define_singleton_method(rb_mProfiler, "report", gc_profile_report, -1);
++#ifdef MY_PROF
++    rb_define_singleton_method(rb_mProfiler, "show_my_prof", gc_show_my_prof, -1);
++#endif
+ 
+     rb_mObSpace = rb_define_module("ObjectSpace");
+     rb_define_module_function(rb_mObSpace, "each_object", os_each_obj, -1);

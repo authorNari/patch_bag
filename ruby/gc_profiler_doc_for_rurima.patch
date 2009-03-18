@@ -1,0 +1,98 @@
+Index: rubydoc/refm/api/src/_builtin/GC__Profiler
+===================================================================
+--- rubydoc/refm/api/src/_builtin/GC__Profiler	(revision 0)
++++ rubydoc/refm/api/src/_builtin/GC__Profiler	(revision 0)
+@@ -0,0 +1,79 @@
++#@since 1.9.0
++= module GC::Profiler
++GCにかかった処理時間やヒープの情報など、GCについてのプロファイル情報を扱うモジュールです。
++
++@see [[c:GC]]
++
++== Singleton Methods 
++
++--- enabled? -> bool
++
++プロファイラの使用状態を返します。
++
++true であれば起動中。
++false であれば停止中。
++
++@see [[m:GC::Profiler.enable]]
++@see [[m:GC::Profiler.disable]]
++
++--- enable -> nil
++
++プロファイラを起動します。
++
++このメソッドを呼び出してからGCが発生すると、GCについてプロファイル情報を取得します。
++
++@see [[m:GC::Profiler.enabled?]]
++@see [[m:GC::Profiler.disable]]
++
++--- disable -> nil
++
++プロファイラを停止します。
++
++このメソッドでは、蓄積したプロファイル情報は破棄しません。
++破棄したい場合は[[m:GC::Profiler.clear]]を呼び出してください。
++
++@see [[m:GC::Profiler.enabled?]]
++@see [[m:GC::Profiler.disable]]
++
++--- clear -> nil
++
++蓄積しているプロファイル情報をすべて削除します。
++
++使用例
++ GC::Profiler.enable
++ GC.start
++ GC.start
++ GC::Profiler.report #=> 2回分のGCプロファイル情報出力
++ GC::Profiler.clear
++ GC.start
++ GC::Profiler.report #=> 1回分のGCプロファイル情報出力
++
++--- result -> String
++
++プロファイル情報の文字列を返します。
++
++フォーマットは以下
++ $ ruby -e "GC::Profiler.enable; a = Array.new(100000){ 'aa' }; puts GC::Profiler.result"
++ GC 5 invokes.
++ Index    Invoke Time(sec)       Use Size(byte)     Total Size(byte)         Total Object                    GC Time(ms)
++     1               0.012               165600               212940                10647         0.00000000000000000000
++     2               0.016               343700               360360                18018         0.00000000000000014129
++     3               0.024               605620               622440                31122         0.00000000000000008843
++     4               0.028              1080280              1097460                54873         0.40010000000000001119
++     5               0.044              1931420              1949220                97461         0.40009999999999984466
++
++各項目の意味
++  * GC invokes - GCの起動回数
++  * Invoke Time - GCが起動したタイミング（Rubyが起動してからの時間）
++  * Use Size - ヒープ内での使用サイズ
++  * Total Size - ヒープ全体のサイズ
++  * Total Object - ヒープ内に存在するオブジェクトの個数
++  * GC Time - GCの処理時間
++
++--- report(out = $stdout) -> nil
++
++[[m:GC::Profiler.result]]の結果をoutに出力します。
++
++@see [[m:GC::Profiler.result]]
++
++#@end
+Index: rubydoc/refm/api/src/_builtin.rd
+===================================================================
+--- rubydoc/refm/api/src/_builtin.rd	(revision 3132)
++++ rubydoc/refm/api/src/_builtin.rd	(working copy)
+@@ -39,6 +39,9 @@
+ #@include(_builtin/Float)
+ #@include(_builtin/FloatDomainError)
+ #@include(_builtin/GC)
++#@since 1.9.0
++#@include(_builtin/GC__Profiler)
++#@end
+ #@include(_builtin/Hash)
+ #@include(_builtin/IO)
+ #@include(_builtin/IOError)
