@@ -1,0 +1,780 @@
+diff --git a/class.c b/class.c
+index 2a5dc61..386188d 100644
+--- a/class.c
++++ b/class.c
+@@ -88,11 +88,13 @@ clone_method(ID mid, NODE *body, struct clone_method_data *data)
+ 	}
+ 	st_insert(data->tbl, mid,
+ 		  (st_data_t)
+-		  NEW_FBODY(
+-		      NEW_METHOD(fbody,
+-				 data->klass, /* TODO */
+-				 body->nd_body->nd_noex),
+-		      0));
++                  NEW_NODE_LONGLIFE(
++                      NODE_FBODY,
++                      0,
++		      NEW_NODE_LONGLIFE(NODE_METHOD,
++                                        rb_gc_write_barrier(data->klass), /* TODO */
++                                        rb_gc_write_barrier(fbody),
++                                        body->nd_body->nd_noex), 0));
+     }
+     return ST_CONTINUE;
+ }
+@@ -810,7 +812,7 @@ rb_define_method_id(VALUE klass, ID name, VALUE (*func)(ANYARGS), int argc)
+     if (func == rb_f_notimplement)
+         rb_define_notimplement_method_id(klass, name, NOEX_PUBLIC);
+     else
+-        rb_add_method(klass, name, NEW_CFUNC(func,argc), NOEX_PUBLIC);
++        rb_add_method(klass, name, NEW_NODE_LONGLIFE(NODE_CFUNC, func, argc, 0), NOEX_PUBLIC);
+ }
+ 
+ void
+@@ -826,7 +828,7 @@ rb_define_protected_method(VALUE klass, const char *name, VALUE (*func)(ANYARGS)
+     if (func == rb_f_notimplement)
+         rb_define_notimplement_method_id(klass, id, NOEX_PROTECTED);
+     else
+-        rb_add_method(klass, id, NEW_CFUNC(func, argc), NOEX_PROTECTED);
++        rb_add_method(klass, id, NEW_NODE_LONGLIFE(NODE_CFUNC, func, argc, 0), NOEX_PROTECTED);
+ }
+ 
+ void
+@@ -836,7 +838,7 @@ rb_define_private_method(VALUE klass, const char *name, VALUE (*func)(ANYARGS),
+     if (func == rb_f_notimplement)
+         rb_define_notimplement_method_id(klass, id, NOEX_PRIVATE);
+     else
+-        rb_add_method(klass, id, NEW_CFUNC(func, argc), NOEX_PRIVATE);
++        rb_add_method(klass, id, NEW_NODE_LONGLIFE(NODE_CFUNC, func, argc, 0), NOEX_PRIVATE);
+ }
+ 
+ void
+diff --git a/debug.c b/debug.c
+index 3b4b76e..b5f2805 100644
+--- a/debug.c
++++ b/debug.c
+@@ -32,7 +32,7 @@ static const union {
+         RUBY_ENC_CODERANGE_VALID   = ENC_CODERANGE_VALID,
+         RUBY_ENC_CODERANGE_BROKEN  = ENC_CODERANGE_BROKEN,
+         RUBY_FL_MARK        = FL_MARK,
+-        RUBY_FL_RESERVED    = FL_RESERVED,
++        RUBY_FL_REMENBERED_SET     = FL_REMEMBERED_SET,
+         RUBY_FL_FINALIZE    = FL_FINALIZE,
+         RUBY_FL_TAINT       = FL_TAINT,
+         RUBY_FL_UNTRUSTED   = FL_UNTRUSTED,
+diff --git a/gc.c b/gc.c
+index 8a4075a..434dbd4 100644
+--- a/gc.c
++++ b/gc.c
+@@ -93,13 +93,18 @@ typedef struct gc_profile_record {
+     double gc_mark_time;
+     double gc_sweep_time;
+     double gc_invoke_time;
++
+     size_t heap_use_slots;
++    size_t heap_longlife_use_slots;
+     size_t heap_live_objects;
+     size_t heap_free_objects;
+     size_t heap_total_objects;
+     size_t heap_use_size;
+     size_t heap_total_size;
++
+     int have_finalize;
++    int longlife_collection;
++
+     size_t allocate_increase;
+     size_t allocate_limit;
+ } gc_profile_record;
+@@ -156,6 +161,7 @@ getrusage_time(void)
+ 	    MEMZERO(&objspace->profile.record[count], gc_profile_record, 1);\
+ 	    gc_time = getrusage_time();\
+ 	    objspace->profile.record[count].gc_invoke_time = gc_time - objspace->profile.invoke_time;\
++	    objspace->profile.record[count].longlife_collection = objspace->flags.longlife_collection;\
+ 	}\
+     } while(0)
+ 
+@@ -210,15 +216,15 @@ getrusage_time(void)
+ 	if (objspace->profile.run) {\
+ 	    size_t count = objspace->profile.count;\
+ 	    objspace->profile.record[count].heap_use_slots = heaps_used;\
+-	    objspace->profile.record[count].heap_live_objects = live;\
+-	    objspace->profile.record[count].heap_free_objects = freed;\
++	    objspace->profile.record[count].heap_longlife_use_slots = objspace->heap.longlife_used;\
++	    objspace->profile.record[count].heap_live_objects = live + objspace->profile.longlife_objects;\
++	    objspace->profile.record[count].heap_free_objects = freed + (objspace->heap.longlife_used * HEAP_OBJ_LIMIT - objspace->profile.longlife_objects); \
+ 	    objspace->profile.record[count].heap_total_objects = heaps_used * HEAP_OBJ_LIMIT;\
+ 	    objspace->profile.record[count].have_finalize = final_list ? Qtrue : Qfalse;\
+-	    objspace->profile.record[count].heap_use_size = live * sizeof(RVALUE);\
++	    objspace->profile.record[count].heap_use_size = (live + objspace->profile.longlife_objects) * sizeof(RVALUE); \
+ 	    objspace->profile.record[count].heap_total_size = heaps_used * (HEAP_OBJ_LIMIT * sizeof(RVALUE));\
+ 	}\
+     } while(0)
+-
+ #else
+ #define INIT_GC_PROF_PARAMS double gc_time = 0;\
+     size_t count = objspace->profile.count
+@@ -231,7 +237,7 @@ getrusage_time(void)
+ 	if (objspace->profile.run) {\
+ 	    size_t count = objspace->profile.count;\
+ 	    objspace->profile.record[count].heap_total_objects = heaps_used * HEAP_OBJ_LIMIT;\
+-	    objspace->profile.record[count].heap_use_size = live * sizeof(RVALUE);\
++	    objspace->profile.record[count].heap_use_size = (live + objspace->profile.longlife_objects) * sizeof(RVALUE); \
+ 	    objspace->profile.record[count].heap_total_size = heaps_used * HEAP_SIZE;\
+ 	}\
+     } while(0)
+@@ -275,10 +281,16 @@ typedef struct RVALUE {
+ #pragma pack(pop)
+ #endif
+ 
++enum lifetime {
++    lifetime_normal,
++    lifetime_longlife
++};
++
+ struct heaps_slot {
+     void *membase;
+     RVALUE *slot;
+     int limit;
++    enum lifetime lifetime;
+ };
+ 
+ #define HEAP_MIN_SLOTS 10000
+@@ -291,6 +303,11 @@ struct gc_list {
+ 
+ #define CALC_EXACT_MALLOC_SIZE 0
+ 
++typedef struct remembered_set {
++    RVALUE *obj;
++    struct remembered_set *next;
++} remembered_set_t;
++
+ typedef struct rb_objspace {
+     struct {
+ 	size_t limit;
+@@ -305,13 +322,20 @@ typedef struct rb_objspace {
+ 	struct heaps_slot *ptr;
+ 	size_t length;
+ 	size_t used;
++	size_t longlife_used;
+ 	RVALUE *freelist;
++	RVALUE *longlife_freelist;
+ 	RVALUE *range[2];
+ 	RVALUE *freed;
+     } heap;
+     struct {
++        remembered_set_t *ptr;
++        remembered_set_t *freed;
++    } remembered_set;
++    struct {
+ 	int dont_gc;
+ 	int during_gc;
++        int longlife_collection;
+     } flags;
+     struct {
+ 	st_table *table;
+@@ -327,6 +351,7 @@ typedef struct rb_objspace {
+ 	gc_profile_record *record;
+ 	size_t count;
+ 	size_t size;
++	size_t longlife_objects;
+ 	double invoke_time;
+     } profile;
+     struct gc_list *global_list;
+@@ -395,6 +420,7 @@ rb_objspace_alloc(void)
+ /*#define HEAP_SIZE 0x800 */
+ 
+ #define HEAP_OBJ_LIMIT (HEAP_SIZE / sizeof(struct RVALUE))
++#define NORMAL_HEAPS_USED (objspace->heap.used - objspace->heap.longlife_used)
+ 
+ extern VALUE rb_cMutex;
+ extern st_table *rb_class_tbl;
+@@ -858,7 +884,7 @@ allocate_heaps(rb_objspace_t *objspace, size_t next_heaps_length)
+ }
+ 
+ static void
+-assign_heap_slot(rb_objspace_t *objspace)
++assign_heap_slot(rb_objspace_t *objspace, RVALUE **list, enum lifetime lifetime)
+ {
+     RVALUE *p, *pend, *membase;
+     size_t hi, lo, mid;
+@@ -902,15 +928,17 @@ assign_heap_slot(rb_objspace_t *objspace)
+     heaps[hi].membase = membase;
+     heaps[hi].slot = p;
+     heaps[hi].limit = objs;
++    heaps[hi].lifetime = lifetime;
+     pend = p + objs;
+     if (lomem == 0 || lomem > p) lomem = p;
+     if (himem < pend) himem = pend;
++    if (lifetime == lifetime_longlife) objspace->heap.longlife_used++;
+     heaps_used++;
+ 
+     while (p < pend) {
+ 	p->as.free.flags = 0;
+-	p->as.free.next = freelist;
+-	freelist = p;
++	p->as.free.next = *list;
++	*list = p;
+ 	p++;
+     }
+ }
+@@ -927,11 +955,11 @@ init_heap(rb_objspace_t *objspace)
+     }
+ 
+     if ((heaps_used + add) > heaps_length) {
+-    	allocate_heaps(objspace, heaps_used + add);
++        allocate_heaps(objspace, heaps_used + add);
+     }
+ 
+     for (i = 0; i < add; i++) {
+-    	assign_heap_slot(objspace);
++        assign_heap_slot(objspace, &freelist, lifetime_normal);
+     }
+     heaps_inc = 0;
+     objspace->profile.invoke_time = getrusage_time();
+@@ -958,16 +986,45 @@ static int
+ heaps_increment(rb_objspace_t *objspace)
+ {
+     if (heaps_inc > 0) {
+-	assign_heap_slot(objspace);
++        assign_heap_slot(objspace, &freelist, lifetime_normal);
+ 	heaps_inc--;
+ 	return Qtrue;
+     }
+     return Qfalse;
+ }
+ 
++#define LONGLIFE_ALLOCATE_HEAPS_MIN 10
++
++static void
++add_longlife_heaps_slot(rb_objspace_t *objspace)
++{
++    if ((heaps_used + heaps_inc) >= heaps_length) {
++        allocate_heaps(objspace, (heaps_length + LONGLIFE_ALLOCATE_HEAPS_MIN));
++    }
++    assign_heap_slot(objspace, &objspace->heap.longlife_freelist, lifetime_longlife);
++}
++
+ #define RANY(o) ((RVALUE*)(o))
+ 
+ static VALUE
++rb_newobj_from_longlife_heap(rb_objspace_t *objspace)
++{
++    VALUE obj;
++    if (!objspace->heap.longlife_freelist) {
++        add_longlife_heaps_slot(objspace);
++    }
++
++    obj = (VALUE)objspace->heap.longlife_freelist;
++    objspace->heap.longlife_freelist = objspace->heap.longlife_freelist->as.free.next;
++
++    MEMZERO((void*)obj, RVALUE, 1);
++    FL_SET(RANY(obj), FL_MARK);
++    objspace->profile.longlife_objects++;
++
++    return obj;
++}
++
++static VALUE
+ rb_newobj_from_heap(rb_objspace_t *objspace)
+ {
+     VALUE obj;
+@@ -1060,6 +1117,22 @@ rb_newobj(void)
+ #endif
+ }
+ 
++VALUE
++rb_newobj_longlife(void)
++{
++#if defined(ENABLE_VM_OBJSPACE) && ENABLE_VM_OBJSPACE
++    rb_objspace_t *objspace = th->vm->objspace;
++#else
++    rb_objspace_t *objspace = &rb_objspace;
++#endif
++    if (during_gc) {
++	dont_gc = 1;
++	during_gc = 0;
++	rb_bug("object allocation during garbage collection phase");
++    }
++    return rb_newobj_from_longlife_heap(objspace);
++}
++
+ NODE*
+ rb_node_newnode(enum node_type type, VALUE a0, VALUE a1, VALUE a2)
+ {
+@@ -1075,6 +1148,21 @@ rb_node_newnode(enum node_type type, VALUE a0, VALUE a1, VALUE a2)
+     return n;
+ }
+ 
++NODE*
++rb_node_newnode_longlife(enum node_type type, VALUE a0, VALUE a1, VALUE a2)
++{
++    NODE *n = (NODE*)rb_newobj_longlife();
++
++    n->flags |= T_NODE;
++    nd_set_type(n, type);
++
++    n->u1.value = a0;
++    n->u2.value = a1;
++    n->u3.value = a2;
++
++    return n;
++}
++
+ VALUE
+ rb_data_object_alloc(VALUE klass, void *datap, RUBY_DATA_FUNC dmark, RUBY_DATA_FUNC dfree)
+ {
+@@ -1231,6 +1319,30 @@ is_pointer_to_heap(rb_objspace_t *objspace, void *ptr)
+     return Qfalse;
+ }
+ 
++VALUE
++rb_gc_write_barrier(VALUE ptr)
++{
++    rb_objspace_t *objspace = &rb_objspace;
++    remembered_set_t *tmp;
++    RVALUE *obj = RANY(ptr);
++
++    if (!SPECIAL_CONST_P(ptr) &&
++        !(RBASIC(ptr)->flags & FL_MARK || RBASIC(ptr)->flags & FL_REMEMBERED_SET)) {
++        if (objspace->remembered_set.freed) {
++            tmp = objspace->remembered_set.freed;
++            objspace->remembered_set.freed = objspace->remembered_set.freed->next;
++        }
++        else {
++            tmp = ALLOC(remembered_set_t);
++        }
++        tmp->next = objspace->remembered_set.ptr;
++        tmp->obj = obj;
++        obj->as.basic.flags |= FL_REMEMBERED_SET;
++        objspace->remembered_set.ptr = tmp;
++    }
++    return ptr;
++}
++
+ static void
+ mark_locations_array(rb_objspace_t *objspace, register VALUE *x, register long n)
+ {
+@@ -1654,12 +1766,12 @@ gc_mark_children(rb_objspace_t *objspace, VALUE ptr, int lev)
+ static int obj_free(rb_objspace_t *, VALUE);
+ 
+ static inline void
+-add_freelist(rb_objspace_t *objspace, RVALUE *p)
++add_freelist(rb_objspace_t *objspace, RVALUE **list, RVALUE *p)
+ {
+     VALGRIND_MAKE_MEM_UNDEFINED((void*)p, sizeof(RVALUE));
+     p->as.free.flags = 0;
+-    p->as.free.next = freelist;
+-    freelist = p;
++    p->as.free.next = *list;
++    *list = p;
+ }
+ 
+ static void
+@@ -1669,7 +1781,7 @@ finalize_list(rb_objspace_t *objspace, RVALUE *p)
+ 	RVALUE *tmp = p->as.free.next;
+ 	run_final(objspace, (VALUE)p);
+ 	if (!FL_TEST(p, FL_SINGLETON)) { /* not freeing page */
+-	    add_freelist(objspace, p);
++	    add_freelist(objspace, &freelist, p);
+ 	}
+ 	else {
+ 	    struct heaps_slot *slot = (struct heaps_slot *)RDATA(p)->dmark;
+@@ -1693,6 +1805,9 @@ free_unused_heaps(rb_objspace_t *objspace)
+ 	    else {
+ 		free(heaps[i].membase);
+ 	    }
++            if (heaps[i].lifetime == lifetime_longlife) {
++                objspace->heap.longlife_used--;
++            }
+ 	    heaps_used--;
+ 	}
+ 	else {
+@@ -1738,6 +1853,7 @@ gc_sweep(rb_objspace_t *objspace)
+ 	RVALUE *final = final_list;
+ 	int deferred;
+ 
++        if (heaps[i].lifetime == lifetime_longlife) continue;
+ 	p = heaps[i].slot; pend = p + heaps[i].limit;
+ 	while (p < pend) {
+ 	    if (!(p->as.basic.flags & FL_MARK)) {
+@@ -1754,7 +1870,7 @@ gc_sweep(rb_objspace_t *objspace)
+ 		    final_num++;
+ 		}
+ 		else {
+-		    add_freelist(objspace, p);
++		    add_freelist(objspace, &freelist, p);
+ 		    free_num++;
+ 		}
+ 	    }
+@@ -1790,8 +1906,10 @@ gc_sweep(rb_objspace_t *objspace)
+     }
+     malloc_increase = 0;
+     if (freed < free_min) {
+-    	set_heaps_increment(objspace);
+-	heaps_increment(objspace);
++        if (!heaps_inc && objspace->heap.longlife_used)
++            objspace->flags.longlife_collection = Qtrue;
++        set_heaps_increment(objspace);
++        heaps_increment(objspace);
+     }
+     during_gc = 0;
+ 
+@@ -1807,11 +1925,67 @@ gc_sweep(rb_objspace_t *objspace)
+     }
+ }
+ 
++static void
++remembered_set_recycle(rb_objspace_t *objspace)
++{
++    remembered_set_t *top = 0, *rem, *next;
++
++    rem = objspace->remembered_set.ptr;
++    while (rem) {
++        next = rem->next;
++        if (RBASIC(rem->obj)->flags & FL_MARK) {
++            top = rem;
++        }
++        else {
++            if (top) {
++                top->next = next;
++            }
++            else {
++                objspace->remembered_set.ptr = next;
++            }
++            rem->obj = 0;
++            rem->next = objspace->remembered_set.freed;
++            objspace->remembered_set.freed = rem;
++        }
++        rem = next;
++    }
++}
++
++static void
++gc_sweep_for_longlife(rb_objspace_t *objspace)
++{
++    RVALUE *p, *pend;
++    size_t i, freed = 0;
++
++    objspace->heap.longlife_freelist = 0;
++    for (i = 0; i < heaps_used; i++) {
++
++        if (heaps[i].lifetime == lifetime_normal) continue;
++	p = heaps[i].slot; pend = p + heaps[i].limit;
++	while (p < pend) {
++	    if (!(p->as.basic.flags & FL_MARK)) {
++                if (p->as.basic.flags) {
++                    obj_free(objspace, (VALUE)p);
++                }
++                add_freelist(objspace, &objspace->heap.longlife_freelist, p);
++                freed++;
++	    }
++	    p++;
++	}
++    }
++
++    remembered_set_recycle(objspace);
++    objspace->flags.longlife_collection = Qfalse;
++    objspace->profile.longlife_objects = objspace->profile.longlife_objects - freed;
++}
++
+ void
+ rb_gc_force_recycle(VALUE p)
+ {
+     rb_objspace_t *objspace = &rb_objspace;
+-    add_freelist(objspace, (RVALUE *)p);
++    if (!(RBASIC(p)->flags & FL_MARK || RBASIC(p)->flags & FL_REMEMBERED_SET)) {
++        add_freelist(objspace, &freelist, (RVALUE *)p);
++    }
+ }
+ 
+ static inline void
+@@ -1997,6 +2171,37 @@ mark_current_machine_context(rb_objspace_t *objspace, rb_thread_t *th)
+ 
+ void rb_gc_mark_encodings(void);
+ 
++static void
++rb_gc_mark_remembered_set(rb_objspace_t *objspace)
++{
++    remembered_set_t *rem;
++
++    rem = objspace->remembered_set.ptr;
++    while (rem) {
++        rb_gc_mark((VALUE)rem->obj);
++        rem = rem->next;
++    }
++}
++
++static void
++clear_mark_longlife_heaps(rb_objspace_t *objspace)
++{
++    int i;
++
++    for (i = 0; i < heaps_used; i++) {
++        RVALUE *p, *pend;
++
++        if (heaps[i].lifetime == lifetime_longlife) {
++            p = heaps[i].slot; pend = p + heaps[i].limit;
++            for (;p < pend; p++) {
++                if (p->as.basic.flags & FL_MARK) {
++                    RBASIC(p)->flags &= ~FL_MARK;
++                }
++            }
++        }
++    }
++}
++
+ static int
+ garbage_collect(rb_objspace_t *objspace)
+ {
+@@ -2028,6 +2233,13 @@ garbage_collect(rb_objspace_t *objspace)
+ 
+     init_mark_stack(objspace);
+ 
++    if (objspace->flags.longlife_collection) {
++        clear_mark_longlife_heaps(objspace);
++    }
++    else {
++        rb_gc_mark_remembered_set(objspace);
++    }
++
+     th->vm->self ? rb_gc_mark(th->vm->self) : rb_vm_mark(th->vm);
+ 
+     if (finalizer_table) {
+@@ -2066,6 +2278,9 @@ garbage_collect(rb_objspace_t *objspace)
+     GC_PROF_MARK_TIMER_STOP;
+ 
+     GC_PROF_SWEEP_TIMER_START;
++    if (objspace->flags.longlife_collection) {
++        gc_sweep_for_longlife(objspace);
++    }
+     gc_sweep(objspace);
+     GC_PROF_SWEEP_TIMER_STOP;
+ 
+@@ -2115,6 +2330,10 @@ rb_gc_mark_machine_stack(rb_thread_t *th)
+ VALUE
+ rb_gc_start(void)
+ {
++    rb_objspace_t *objspace = &rb_objspace;
++    if (objspace->heap.longlife_used) {
++        objspace->flags.longlife_collection = Qtrue;
++    }
+     rb_gc();
+     return Qnil;
+ }
+@@ -2783,11 +3002,13 @@ gc_profile_record_get(void)
+         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_TOTAL_SIZE")), rb_uint2inum(objspace->profile.record[i].heap_total_size));
+         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_TOTAL_OBJECTS")), rb_uint2inum(objspace->profile.record[i].heap_total_objects));
+ #if GC_PROFILE_MORE_DETAIL
++        rb_hash_aset(prof, ID2SYM(rb_intern("LONGLIFE_COLLECTION")), objspace->profile.record[i].longlife_collection);
+         rb_hash_aset(prof, ID2SYM(rb_intern("GC_MARK_TIME")), DBL2NUM(objspace->profile.record[i].gc_mark_time));
+         rb_hash_aset(prof, ID2SYM(rb_intern("GC_SWEEP_TIME")), DBL2NUM(objspace->profile.record[i].gc_sweep_time));
+         rb_hash_aset(prof, ID2SYM(rb_intern("ALLOCATE_INCREASE")), rb_uint2inum(objspace->profile.record[i].allocate_increase));
+         rb_hash_aset(prof, ID2SYM(rb_intern("ALLOCATE_LIMIT")), rb_uint2inum(objspace->profile.record[i].allocate_limit));
+         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_USE_SLOTS")), rb_uint2inum(objspace->profile.record[i].heap_use_slots));
++        rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_LONGLIFE_USE_SLOTS")), rb_uint2inum(objspace->profile.record[i].heap_longlife_use_slots));
+         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_LIVE_OBJECTS")), rb_uint2inum(objspace->profile.record[i].heap_live_objects));
+         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_FREE_OBJECTS")), rb_uint2inum(objspace->profile.record[i].heap_free_objects));
+         rb_hash_aset(prof, ID2SYM(rb_intern("HAVE_FINALIZE")), objspace->profile.record[i].have_finalize);
+@@ -2829,21 +3050,25 @@ gc_profile_result(void)
+ 			NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("HEAP_USE_SIZE")))),
+ 			NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("HEAP_TOTAL_SIZE")))),
+ 			NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("HEAP_TOTAL_OBJECTS")))),
+-			NUM2DBL(rb_hash_aref(r, ID2SYM(rb_intern("GC_TIME"))))*1000);
++			NUM2DBL(rb_hash_aref(r, ID2SYM(rb_intern("GC_TIME"))))*1000
++                );
+ 	}
+ #if GC_PROFILE_MORE_DETAIL
+ 	rb_str_cat2(result, "\n\n");
+ 	rb_str_cat2(result, "More detail.\n");
+-	rb_str_cat2(result, "Index Allocate Increase    Allocate Limit  Use Slot  Have Finalize             Mark Time(ms)            Sweep Time(ms)\n");
++	rb_str_cat2(result, "Index Allocate Increase    Allocate Limit  Use Slot  Longlife Slot  Have Finalize  Collection             Mark Time(ms)            Sweep Time(ms)\n");
+ 	for (i = 0; i < (int)RARRAY_LEN(record); i++) {
+ 	    VALUE r = RARRAY_PTR(record)[i];
+-	    rb_str_catf(result, "%5d %17d %17d %9d %14s %25.20f %25.20f\n",
++	    rb_str_catf(result, "%5d %17d %17d %9d %14d %14s %11s %25.20f %25.20f\n",
+ 			i+1, NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("ALLOCATE_INCREASE")))),
+ 			NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("ALLOCATE_LIMIT")))),
+ 			NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("HEAP_USE_SLOTS")))),
++			NUM2INT(rb_hash_aref(r, ID2SYM(rb_intern("HEAP_LONGLIFE_USE_SLOTS")))),
+ 			rb_hash_aref(r, ID2SYM(rb_intern("HAVE_FINALIZE")))? "true" : "false",
++			rb_hash_aref(r, ID2SYM(rb_intern("LONGLIFE_COLLECTION")))? "longlife" : "normal",
+ 			NUM2DBL(rb_hash_aref(r, ID2SYM(rb_intern("GC_MARK_TIME"))))*1000,
+-			NUM2DBL(rb_hash_aref(r, ID2SYM(rb_intern("GC_SWEEP_TIME"))))*1000);
++			NUM2DBL(rb_hash_aref(r, ID2SYM(rb_intern("GC_SWEEP_TIME"))))*1000
++                );
+ 	}
+ #endif
+     }
+@@ -2878,7 +3103,6 @@ gc_profile_report(int argc, VALUE *argv, VALUE self)
+     return Qnil;
+ }
+ 
+-
+ /*
+  *  The <code>GC</code> module provides an interface to Ruby's mark and
+  *  sweep garbage collection mechanism. Some of the underlying methods
+diff --git a/include/ruby/intern.h b/include/ruby/intern.h
+index 899a7b3..ae44385 100644
+--- a/include/ruby/intern.h
++++ b/include/ruby/intern.h
+@@ -367,6 +367,7 @@ void rb_gc_mark_maybe(VALUE);
+ void rb_gc_mark(VALUE);
+ void rb_gc_force_recycle(VALUE);
+ void rb_gc(void);
++VALUE rb_gc_write_barrier(VALUE);
+ void rb_gc_copy_finalizer(VALUE,VALUE);
+ void rb_gc_finalize_deferred(void);
+ void rb_gc_call_finalizer_at_exit(void);
+diff --git a/include/ruby/ruby.h b/include/ruby/ruby.h
+index 7a83887..a277bb2 100644
+--- a/include/ruby/ruby.h
++++ b/include/ruby/ruby.h
+@@ -809,7 +809,7 @@ struct RBignum {
+ 
+ #define FL_SINGLETON FL_USER0
+ #define FL_MARK      (((VALUE)1)<<5)
+-#define FL_RESERVED  (((VALUE)1)<<6) /* will be used in the future GC */
++#define FL_REMEMBERED_SET  (((VALUE)1)<<6)
+ #define FL_FINALIZE  (((VALUE)1)<<7)
+ #define FL_TAINT     (((VALUE)1)<<8)
+ #define FL_UNTRUSTED (((VALUE)1)<<9)
+diff --git a/insns.def b/insns.def
+index bc93010..e1e77c6 100644
+--- a/insns.def
++++ b/insns.def
+@@ -1222,7 +1222,7 @@ setinlinecache
+ {
+     IC ic = GET_CONST_INLINE_CACHE(dst);
+ 
+-    ic->ic_value = val;
++    ic->ic_value = rb_gc_write_barrier(val);
+     ic->ic_vmstat = GET_VM_STATE_VERSION() - ruby_vm_const_missing_count;
+     ruby_vm_const_missing_count = 0;
+ }
+diff --git a/iseq.c b/iseq.c
+index cc2ffaa..a102941 100644
+--- a/iseq.c
++++ b/iseq.c
+@@ -131,12 +131,12 @@ set_relation(rb_iseq_t *iseq, const VALUE parent)
+     /* set class nest stack */
+     if (type == ISEQ_TYPE_TOP) {
+ 	/* toplevel is private */
+-	iseq->cref_stack = NEW_BLOCK(th->top_wrapper ? th->top_wrapper : rb_cObject);
++	iseq->cref_stack = NEW_NODE_LONGLIFE(NODE_BLOCK, th->top_wrapper ? th->top_wrapper : rb_cObject, 0, 0);
+ 	iseq->cref_stack->nd_file = 0;
+ 	iseq->cref_stack->nd_visi = NOEX_PRIVATE;
+     }
+     else if (type == ISEQ_TYPE_METHOD || type == ISEQ_TYPE_CLASS) {
+-	iseq->cref_stack = NEW_BLOCK(0); /* place holder */
++	iseq->cref_stack = NEW_NODE_LONGLIFE(NODE_BLOCK,0,0,0); /* place holder */
+ 	iseq->cref_stack->nd_file = 0;
+     }
+     else if (RTEST(parent)) {
+diff --git a/node.h b/node.h
+index 8de2082..c6a0fbb 100644
+--- a/node.h
++++ b/node.h
+@@ -354,6 +354,7 @@ typedef struct RNode {
+ #define nd_visi  u2.argc
+ 
+ #define NEW_NODE(t,a0,a1,a2) rb_node_newnode((t),(VALUE)(a0),(VALUE)(a1),(VALUE)(a2))
++#define NEW_NODE_LONGLIFE(t,a0,a1,a2) rb_node_newnode_longlife((t),(VALUE)(a0),(VALUE)(a1),(VALUE)(a2))
+ 
+ #define NEW_METHOD(n,x,v) NEW_NODE(NODE_METHOD,x,n,v)
+ #define NEW_FBODY(n,i) NEW_NODE(NODE_FBODY,i,n,0)
+@@ -497,6 +498,7 @@ NODE *rb_compile_file(const char*, VALUE, int);
+ 
+ void rb_add_method(VALUE, ID, NODE *, int);
+ NODE *rb_node_newnode(enum node_type,VALUE,VALUE,VALUE);
++NODE *rb_node_newnode_longlife(enum node_type,VALUE,VALUE,VALUE);
+ 
+ NODE* rb_method_node(VALUE klass, ID id);
+ int rb_node_arity(NODE* node);
+diff --git a/vm.c b/vm.c
+index 17c2697..0b05de1 100644
+--- a/vm.c
++++ b/vm.c
+@@ -1702,7 +1702,7 @@ vm_define_method(rb_thread_t *th, VALUE obj, ID id, VALUE iseqval,
+     COPY_CREF(miseq->cref_stack, cref);
+     miseq->klass = klass;
+     miseq->defined_method_id = id;
+-    newbody = NEW_NODE(RUBY_VM_METHOD_NODE, 0, miseq->self, 0);
++    newbody = NEW_NODE_LONGLIFE(RUBY_VM_METHOD_NODE, 0, rb_gc_write_barrier(miseq->self), 0);
+     rb_add_method(klass, id, newbody, noex);
+ 
+     if (!is_singleton && noex == NOEX_MODFUNC) {
+diff --git a/vm_core.h b/vm_core.h
+index 511c1e3..ed96392 100644
+--- a/vm_core.h
++++ b/vm_core.h
+@@ -523,7 +523,7 @@ typedef struct {
+ 
+ 
+ /* inline (method|const) cache */
+-#define NEW_INLINE_CACHE_ENTRY() NEW_WHILE(Qundef, 0, 0)
++#define NEW_INLINE_CACHE_ENTRY() NEW_NODE_LONGLIFE(NODE_WHILE, Qundef, 0, 0)
+ #define ic_class  u1.value
+ #define ic_method u2.node
+ #define ic_value  u2.value
+diff --git a/vm_insnhelper.c b/vm_insnhelper.c
+index 5293af3..13bbcf7 100644
+--- a/vm_insnhelper.c
++++ b/vm_insnhelper.c
+@@ -1170,8 +1170,8 @@ vm_method_search(VALUE id, VALUE klass, IC ic)
+ 	}
+ 	else {
+ 	    mn = rb_method_node(klass, id);
+-	    ic->ic_class = klass;
+-	    ic->ic_method = mn;
++	    ic->ic_class = rb_gc_write_barrier(klass);
++	    ic->ic_method = (NODE *)rb_gc_write_barrier((VALUE)mn);
+ 	    ic->ic_vmstat = GET_VM_STATE_VERSION();
+ 	}
+     }
+diff --git a/vm_method.c b/vm_method.c
+index aabe75d..25d2e6d 100644
+--- a/vm_method.c
++++ b/vm_method.c
+@@ -142,9 +142,12 @@ rb_add_method(VALUE klass, ID mid, NODE * node, int noex)
+      *   nd_cnt  : alias count           // (3)
+      */
+     if (node) {
+-	NODE *method = NEW_METHOD(node, klass, NOEX_WITH_SAFE(noex));
++        NODE *method = NEW_NODE_LONGLIFE(NODE_METHOD,
++                                         rb_gc_write_barrier(klass),
++                                         rb_gc_write_barrier((VALUE)node),
++                                         NOEX_WITH_SAFE(noex));
+ 	method->nd_file = (void *)mid;
+-	body = NEW_FBODY(method, mid);
++	body = NEW_NODE_LONGLIFE(NODE_FBODY, mid, method, 0);
+     }
+     else {
+ 	body = 0;
+@@ -195,7 +198,8 @@ void
+ rb_define_alloc_func(VALUE klass, VALUE (*func)(VALUE))
+ {
+     Check_Type(klass, T_CLASS);
+-    rb_add_method(rb_singleton_class(klass), ID_ALLOCATOR, NEW_CFUNC(func, 0),
++    rb_add_method(rb_singleton_class(klass), ID_ALLOCATOR,
++                  NEW_NODE_LONGLIFE(NODE_CFUNC, func, 0, 0),
+ 		  NOEX_PRIVATE);
+ }
+ 
+@@ -774,10 +778,14 @@ rb_alias(VALUE klass, ID name, ID def)
+     }
+ 
+     st_insert(RCLASS_M_TBL(klass), name,
+-	      (st_data_t) NEW_FBODY(
+-		  method = NEW_METHOD(orig_fbody->nd_body->nd_body,
+-			     orig_fbody->nd_body->nd_clss,
+-			     NOEX_WITH_SAFE(orig_fbody->nd_body->nd_noex)), def));
++	      (st_data_t) NEW_NODE_LONGLIFE(
++                  NODE_FBODY,
++                  def,
++                  method = NEW_NODE_LONGLIFE(NODE_METHOD,
++                                             rb_gc_write_barrier((VALUE)orig_fbody->nd_body->nd_clss),
++                                             rb_gc_write_barrier((VALUE)orig_fbody->nd_body->nd_body),
++                                             NOEX_WITH_SAFE(orig_fbody->nd_body->nd_noex)),
++                  0));
+     method->nd_file = (void *)def;
+ 
+     rb_clear_cache_by_id(name);
