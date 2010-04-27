@@ -65,7 +65,7 @@ index 265e864..c677560 100644
          RUBY_FL_TAINT       = FL_TAINT,
          RUBY_FL_UNTRUSTED   = FL_UNTRUSTED,
 diff --git a/gc.c b/gc.c
-index 784949c..cd36385 100644
+index 784949c..3abc7c1 100644
 --- a/gc.c
 +++ b/gc.c
 @@ -22,6 +22,7 @@
@@ -76,14 +76,7 @@ index 784949c..cd36385 100644
  
  #ifdef HAVE_SYS_TIME_H
  #include <sys/time.h>
-@@ -87,19 +88,24 @@ int ruby_gc_debug_indent = 0;
- #undef GC_DEBUG
- 
- /* for GC profile */
--#define GC_PROFILE_MORE_DETAIL 0
-+#define GC_PROFILE_MORE_DETAIL 1
- typedef struct gc_profile_record {
-     double gc_time;
+@@ -93,13 +94,18 @@ typedef struct gc_profile_record {
      double gc_mark_time;
      double gc_sweep_time;
      double gc_invoke_time;
