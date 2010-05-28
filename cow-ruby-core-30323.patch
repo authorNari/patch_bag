@@ -1,0 +1,93 @@
+Index: gc.c
+===================================================================
+--- gc.c	(revision 27918)
++++ gc.c	(working copy)
+@@ -280,6 +280,7 @@
+     void *membase;
+     RVALUE *slot;
+     size_t limit;
++    int leaked;
+ };
+ 
+ #define HEAP_MIN_SLOTS 10000
+@@ -485,6 +486,55 @@
+ 
+ /*
+  *  call-seq:
++ *    GC.leak                 -> nil
++ *
++ *  marks all heaps as leaked and all objects with FL_MARK
++ *  to prevent GC from touching that memory (COW-friendly)
++ */
++
++static VALUE
++gc_leak(VALUE self)
++{
++    rb_objspace_t *objspace = &rb_objspace;
++    RVALUE *p, *pend;
++    size_t i;
++
++    for (i = 0; i < heaps_used; i++) {
++        p = heaps[i].slot; pend = p + heaps[i].limit;
++        while (p < pend) {
++            if ((p->as.basic.flags != 0) &&
++                !(p->as.basic.flags & FL_MARK)) {
++              p->as.basic.flags |= FL_MARK;
++            }
++            p++;
++        }
++        heaps[i].leaked = TRUE;
++    }
++    freelist = NULL;
++    return Qnil;
++}
++
++/*
++ *  call-seq:
++ *    GC.unleak                 -> nil
++ *
++ *  set currently leaked heaps to be reclaimed on next GC
++ */
++
++static VALUE
++gc_unleak(VALUE self)
++{
++    rb_objspace_t *objspace = &rb_objspace;
++    size_t i;
++
++    for (i = 0; i < heaps_used; i++) {
++        heaps[i].leaked = FALSE;
++    }
++    return Qnil;
++}
++
++/*
++ *  call-seq:
+  *    GC.stress                 -> true or false
+  *
+  *  returns current status of GC stress mode.
+@@ -938,6 +988,7 @@
+     heaps[hi].membase = membase;
+     heaps[hi].slot = p;
+     heaps[hi].limit = objs;
++    heaps[hi].leaked = FALSE;
+     pend = p + objs;
+     if (lomem == 0 || lomem > p) lomem = p;
+     if (himem < pend) himem = pend;
+@@ -1874,6 +1925,7 @@
+ 	RVALUE *final = final_list;
+ 	int deferred;
+ 
++        if (heaps[i].leaked) continue;
+ 	p = heaps[i].slot; pend = p + heaps[i].limit;
+ 	while (p < pend) {
+ 	    if (!(p->as.basic.flags & FL_MARK)) {
+@@ -3178,6 +3230,8 @@
+     rb_define_singleton_method(rb_mGC, "start", rb_gc_start, 0);
+     rb_define_singleton_method(rb_mGC, "enable", rb_gc_enable, 0);
+     rb_define_singleton_method(rb_mGC, "disable", rb_gc_disable, 0);
++    rb_define_singleton_method(rb_mGC, "leak", gc_leak, 0);
++    rb_define_singleton_method(rb_mGC, "unleak", gc_unleak, 0);
+     rb_define_singleton_method(rb_mGC, "stress", gc_stress_get, 0);
+     rb_define_singleton_method(rb_mGC, "stress=", gc_stress_set, 1);
+     rb_define_singleton_method(rb_mGC, "count", gc_count, 0);
